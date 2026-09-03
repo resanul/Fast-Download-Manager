@@ -34,6 +34,8 @@ class DownloadTask:
     checksum_algorithm: str | None = None
     expected_checksum: str | None = None
     actual_checksum: str | None = None
+    speed_started: float = 0.0
+    speed_baseline: int = 0
 
 
 class DownloadEngine:
@@ -77,6 +79,9 @@ class DownloadEngine:
         self._cancel.discard(task.id)
         task.status = "analyzing"
         task.error = None
+        task.speed = 0.0
+        task.speed_started = time.monotonic()
+        task.speed_baseline = task.downloaded
         try:
             meta = await self.analyze(task.url)
             task.url = meta["url"]
@@ -88,7 +93,9 @@ class DownloadEngine:
             else:
                 await self._single(task, progress)
             if task.checksum_algorithm and task.expected_checksum:
-                task.actual_checksum = await asyncio.to_thread(self._hash_file, task.destination, task.checksum_algorithm)
+                task.actual_checksum = await asyncio.to_thread(
+                    self._hash_file, task.destination, task.checksum_algorithm
+                )
                 if task.actual_checksum.lower() != task.expected_checksum.lower():
                     task.destination.unlink(missing_ok=True)
                     raise RuntimeError("Checksum verification failed")
@@ -99,11 +106,13 @@ class DownloadEngine:
             return task
         except asyncio.CancelledError:
             task.status = "cancelled"
+            task.speed = 0.0
             if progress:
                 progress(task)
             raise
         except Exception as exc:
             task.status = "failed"
+            task.speed = 0.0
             task.error = str(exc)
             if progress:
                 progress(task)
@@ -112,6 +121,9 @@ class DownloadEngine:
     async def _single(self, task: DownloadTask, progress=None):
         temp = task.destination.with_suffix(task.destination.suffix + ".part")
         existing = temp.stat().st_size if temp.exists() else 0
+        task.downloaded = existing
+        task.speed_baseline = existing
+        task.speed_started = time.monotonic()
         for attempt in range(self.retries):
             try:
                 headers = {"Range": f"bytes={existing}-"} if existing else {}
@@ -121,8 +133,9 @@ class DownloadEngine:
                     r.raise_for_status()
                     if existing and r.status_code != 206:
                         existing = 0
+                        task.downloaded = 0
+                        task.speed_baseline = 0
                         temp.unlink(missing_ok=True)
-                        headers = {}
                         continue
                     await self._write_stream(task, r, temp, existing, progress)
                 if task.total is None:
@@ -143,11 +156,11 @@ class DownloadEngine:
     async def _write_stream(self, task, response, path, initial, progress):
         mode = "ab" if initial else "wb"
         done = initial
-        started = time.monotonic()
         with path.open(mode) as f:
             async for chunk in response.aiter_bytes(self.chunk_size):
                 while task.id in self._pause:
                     task.status = "paused"
+                    task.speed = self._speed(task)
                     if progress:
                         progress(task)
                     await asyncio.sleep(0.2)
@@ -158,8 +171,7 @@ class DownloadEngine:
                 f.flush()
                 done += len(chunk)
                 task.downloaded = done
-                elapsed = max(time.monotonic() - started, 0.001)
-                task.speed = max(0.0, (done - initial) / elapsed)
+                task.speed = self._speed(task)
                 if progress:
                     progress(task)
 
@@ -169,7 +181,13 @@ class DownloadEngine:
         size = total // n
         tempdir = task.destination.parent / (task.destination.name + ".segments")
         tempdir.mkdir(exist_ok=True)
-        task.segments = [Segment(i * size, total - 1 if i == n - 1 else (i + 1) * size - 1) for i in range(n)]
+        task.segments = [
+            Segment(i * size, total - 1 if i == n - 1 else (i + 1) * size - 1)
+            for i in range(n)
+        ]
+        task.downloaded = 0
+        task.speed_baseline = 0
+        task.speed_started = time.monotonic()
         lock = asyncio.Lock()
 
         async def worker(i, seg):
@@ -191,6 +209,7 @@ class DownloadEngine:
                                 async for chunk in r.aiter_bytes(self.chunk_size):
                                     while task.id in self._pause:
                                         task.status = "paused"
+                                        task.speed = self._speed(task)
                                         if progress:
                                             progress(task)
                                         await asyncio.sleep(0.2)
@@ -203,6 +222,7 @@ class DownloadEngine:
                                     seg.downloaded = have
                                     async with lock:
                                         task.downloaded = sum(s.downloaded for s in task.segments)
+                                        task.speed = self._speed(task)
                                     if progress:
                                         progress(task)
                             if have != seg.end - seg.start + 1:
@@ -229,6 +249,13 @@ class DownloadEngine:
         for p in tempdir.glob("*.part"):
             p.unlink(missing_ok=True)
         tempdir.rmdir()
+
+    @staticmethod
+    def _speed(task: DownloadTask) -> float:
+        started = task.speed_started or time.monotonic()
+        elapsed = max(time.monotonic() - started, 0.001)
+        transferred = max(0, task.downloaded - task.speed_baseline)
+        return transferred / elapsed
 
     @staticmethod
     def _hash_file(path: Path, algorithm: str) -> str:
