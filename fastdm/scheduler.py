@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Awaitable, Callable
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -17,7 +17,7 @@ class Schedule:
     enabled: bool = True
 
     @classmethod
-    def once(cls, task_id: str, run_at: datetime, schedule_id: str | None = None) -> "Schedule":
+    def once(cls, task_id: str, run_at: datetime, schedule_id: str | None = None) -> Schedule:
         return cls(schedule_id or uuid.uuid4().hex, task_id, _timestamp(run_at))
 
     @classmethod
@@ -27,7 +27,7 @@ class Schedule:
         run_at: datetime,
         interval: float,
         schedule_id: str | None = None,
-    ) -> "Schedule":
+    ) -> Schedule:
         if interval <= 0:
             raise ValueError("interval must be greater than zero")
         return cls(schedule_id or uuid.uuid4().hex, task_id, _timestamp(run_at), interval)
@@ -49,7 +49,7 @@ class Schedule:
 def _timestamp(value: datetime) -> float:
     if value.tzinfo is None:
         value = value.astimezone()
-    return value.astimezone(timezone.utc).timestamp()
+    return value.astimezone(UTC).timestamp()
 
 
 class Scheduler:
@@ -99,7 +99,7 @@ class Scheduler:
                         self._schedules.pop(schedule.id, None)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         finally:
             self._runner = None
