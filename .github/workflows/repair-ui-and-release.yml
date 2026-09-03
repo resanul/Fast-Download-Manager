@@ -36,9 +36,6 @@ jobs:
           old1 = '''                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:\n                    async with client.stream("GET", task.url, headers=headers) as response:'''
           new1 = '''                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client, client.stream("GET", task.url, headers=headers) as response:'''
           text = text.replace(old1, new1)
-          old2 = '''                        async with client.stream("GET", task.url, headers=headers) as response:'''
-          new2 = '''                        async with client.stream("GET", task.url, headers=headers) as response:'''
-          text = text.replace(old2, new2)
           engine.write_text(text, encoding="utf-8")
 
           release = Path(".github/workflows/repair-release-012.yml")
@@ -80,3 +77,5 @@ jobs:
           fi
           git commit -m "fix: repair Qt layout runtime and prepare v0.1.5"
           git push origin HEAD:main
+
+# Trigger marker: repair runtime layout before publishing v0.1.5
