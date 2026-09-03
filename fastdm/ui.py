@@ -55,7 +55,8 @@ class MainWindow(QMainWindow):
         self.resize(1200, 760)
         self.engine = DownloadEngine()
         self.db = Database(self._db_path())
-        self.queue = DownloadQueue(max_concurrent=3)
+        saved_concurrency = int(self.db.get_setting("max_concurrent", "3") or 3)
+        self.queue = DownloadQueue(max_concurrent=max(1, min(saved_concurrency, 8)))
         self.rows: dict[str, int] = {}
         self.tasks: dict[str, DownloadTask] = {}
         self.workers: dict[str, Worker] = {}
@@ -99,7 +100,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("Max concurrent:"))
         self.concurrency = QSpinBox()
         self.concurrency.setRange(1, 8)
-        self.concurrency.setValue(3)
+        self.concurrency.setValue(self.queue.max_concurrent)
         self.concurrency.valueChanged.connect(self.set_concurrency)
         controls.addWidget(self.concurrency)
         controls.addStretch(1)
@@ -114,7 +115,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
-        self.status = QLabel("Ready · Queue 0 · Active 0/3")
+        self.status = QLabel("Ready")
         layout.addWidget(self.status)
         self.setStyleSheet(
             "QMainWindow{background:#101318;color:#eee}"
@@ -125,6 +126,7 @@ class MainWindow(QMainWindow):
         )
         self.load_history()
         self._update_queue_status()
+        self._pump_queue()
 
     @staticmethod
     def _db_path() -> Path:
@@ -135,15 +137,35 @@ class MainWindow(QMainWindow):
 
     def load_history(self):
         for item in self.db.list():
+            try:
+                priority = Priority(int(item["priority"] or Priority.NORMAL))
+            except (ValueError, TypeError):
+                priority = Priority.NORMAL
+            status = item["status"]
+            task = None
+            if status in {"queued", "paused", "analyzing", "downloading"}:
+                task = DownloadTask(
+                    item["id"],
+                    item["url"],
+                    Path(item["destination"]),
+                    total=item["total"],
+                    downloaded=item["downloaded"] or 0,
+                    status="queued",
+                    created=item["created"],
+                )
+                self.tasks[task.id] = task
+                self.priorities[task.id] = priority
+                self.queue.enqueue(task.id, priority)
+                status = "queued"
             row = self._insert_row(
                 item["id"],
                 item["filename"],
-                item["status"],
+                status,
                 item["downloaded"],
                 item["total"],
                 item["speed"],
                 item["destination"],
-                Priority.NORMAL,
+                priority,
             )
             self.rows[item["id"]] = row
 
@@ -186,6 +208,7 @@ class MainWindow(QMainWindow):
 
     def set_concurrency(self, value: int):
         self.queue.max_concurrent = max(1, value)
+        self.db.set_setting("max_concurrent", str(self.queue.max_concurrent))
         self._pump_queue()
         self._update_queue_status()
 
@@ -319,6 +342,7 @@ class MainWindow(QMainWindow):
                 "status": task.status,
                 "speed": task.speed,
                 "created": task.created,
+                "priority": int(self.priorities.get(task.id, Priority.NORMAL)),
             }
         )
 
