@@ -44,8 +44,6 @@ class SpeedMeter:
         elapsed = now - self.last_time
         delta = max(0, bytes_done - self.last_bytes)
         if delta > 0:
-            # Clamp the sample interval so a worker thread waking after a long
-            # scheduling gap does not turn a healthy transfer into ~0 B/s.
             sample_elapsed = min(max(elapsed, 0.001), 2.0)
             self.speed = delta / sample_elapsed
             self.peak = max(self.peak, self.speed)
@@ -210,7 +208,7 @@ class DownloadEngine:
             async for chunk in response.aiter_bytes(self.chunk_size):
                 while task.id in self._pause:
                     task.status = "paused"
-                    task.speed = task.speed_meter.speed
+                    task.speed = max(task.speed_meter.speed, task.speed_meter.average(done))
                     if progress:
                         progress(task)
                     await asyncio.sleep(0.2)
@@ -266,7 +264,7 @@ class DownloadEngine:
                                 async for chunk in r.aiter_bytes(self.chunk_size):
                                     while task.id in self._pause:
                                         task.status = "paused"
-                                        task.speed = task.speed_meter.speed
+                                        task.speed = max(task.speed_meter.speed, task.speed_meter.average(task.downloaded))
                                         if progress:
                                             progress(task)
                                         await asyncio.sleep(0.2)
@@ -320,8 +318,13 @@ class DownloadEngine:
         return actual.lower() == expected.lower()
 
     def _update_speed(self, task: DownloadTask) -> None:
-        task.speed = task.speed_meter.update(task.downloaded)
-        task.peak_speed = task.speed_meter.peak
+        instantaneous = task.speed_meter.update(task.downloaded)
+        average = task.speed_meter.average(task.downloaded)
+        # The UI should never report 0 B/s while bytes are actively arriving.
+        # Average throughput is used as a stable fallback when concurrent worker
+        # scheduling makes a single instantaneous sample momentarily zero.
+        task.speed = max(instantaneous, average if task.downloaded > task.speed_baseline else 0.0)
+        task.peak_speed = max(task.peak_speed, task.speed_meter.peak, task.speed)
 
     def pause(self, task_id: str):
         self._pause.add(task_id)
