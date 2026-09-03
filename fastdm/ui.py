@@ -3,13 +3,19 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QDateTime, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDateTimeEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -25,6 +31,7 @@ from PySide6.QtWidgets import (
 from .db import Database
 from .engine import DownloadEngine, DownloadTask
 from .queue import DownloadQueue, Priority
+from .scheduler import Schedule, Scheduler
 
 
 class Worker(QObject):
@@ -48,6 +55,42 @@ class Worker(QObject):
             self.failed.emit(str(exc))
 
 
+class ScheduleDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Schedule Download")
+        self.setModal(True)
+
+        form = QFormLayout(self)
+        self.when = QDateTimeEdit(QDateTime.currentDateTime().addSecs(60))
+        self.when.setCalendarPopup(True)
+        self.when.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        form.addRow("Start at:", self.when)
+
+        self.recurring = QCheckBox("Repeat automatically")
+        form.addRow("Recurrence:", self.recurring)
+
+        self.interval = QSpinBox()
+        self.interval.setRange(1, 10080)
+        self.interval.setValue(60)
+        self.interval.setSuffix(" minutes")
+        self.interval.setEnabled(False)
+        self.recurring.toggled.connect(self.interval.setEnabled)
+        form.addRow("Every:", self.interval)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> tuple[datetime, float | None]:
+        run_at = datetime.fromtimestamp(self.when.dateTime().toSecsSinceEpoch(), tz=UTC)
+        interval = self.interval.value() * 60.0 if self.recurring.isChecked() else None
+        return run_at, interval
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -57,6 +100,8 @@ class MainWindow(QMainWindow):
         self.db = Database(self._db_path())
         saved_concurrency = int(self.db.get_setting("max_concurrent", "3") or 3)
         self.queue = DownloadQueue(max_concurrent=max(1, min(saved_concurrency, 8)))
+        self.scheduler = Scheduler()
+        self.schedules: dict[str, Schedule] = {}
         self.rows: dict[str, int] = {}
         self.tasks: dict[str, DownloadTask] = {}
         self.workers: dict[str, Worker] = {}
@@ -92,6 +137,7 @@ class MainWindow(QMainWindow):
             ("Resume", self.resume_selected),
             ("Cancel", self.cancel_selected),
             ("Retry", self.retry_selected),
+            ("Schedule", self.schedule_selected),
             ("Open Folder", self.open_folder_selected),
         ):
             button = QPushButton(label)
@@ -120,11 +166,17 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             "QMainWindow{background:#101318;color:#eee}"
             "QLabel#title{font-size:28px;font-weight:700;margin:12px}"
-            "QLineEdit,QTableWidget,QComboBox,QSpinBox{background:#181c23;color:#eee;border:1px solid #303744;border-radius:8px;padding:8px}"
+            "QLineEdit,QTableWidget,QComboBox,QSpinBox,QDateTimeEdit{background:#181c23;color:#eee;border:1px solid #303744;border-radius:8px;padding:8px}"
             "QPushButton{background:#2563eb;color:white;border:0;border-radius:8px;padding:10px 16px;font-weight:600}"
             "QHeaderView::section{background:#222733;color:#bbb;padding:8px}"
         )
+
         self.load_history()
+        self.load_schedules()
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.setInterval(1000)
+        self._schedule_timer.timeout.connect(self._process_schedules)
+        self._schedule_timer.start()
         self._update_queue_status()
         self._pump_queue()
 
@@ -142,7 +194,6 @@ class MainWindow(QMainWindow):
             except (ValueError, TypeError):
                 priority = Priority.NORMAL
             status = item["status"]
-            task = None
             if status in {"queued", "paused", "analyzing", "downloading"}:
                 task = DownloadTask(
                     item["id"],
@@ -168,6 +219,88 @@ class MainWindow(QMainWindow):
                 priority,
             )
             self.rows[item["id"]] = row
+
+    def load_schedules(self):
+        for item in self.db.list_schedules():
+            schedule = Schedule(
+                item["id"],
+                item["task_id"],
+                float(item["run_at"]),
+                float(item["interval"]) if item["interval"] is not None else None,
+                bool(item["enabled"]),
+            )
+            if schedule.task_id in self.tasks and schedule.enabled:
+                self.scheduler.add(schedule)
+                self.schedules[schedule.id] = schedule
+                self._set_task_status(schedule.task_id, "scheduled")
+
+    def schedule_selected(self):
+        task = self._selected_task()
+        if not task:
+            self.status.setText("Select a download to schedule")
+            return
+        if task.status in {"downloading", "completed"}:
+            self.status.setText("Only queued, failed, or cancelled downloads can be scheduled")
+            return
+        dialog = ScheduleDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        run_at, interval = dialog.values()
+        schedule = (
+            Schedule.recurring(task.id, run_at, interval)
+            if interval is not None
+            else Schedule.once(task.id, run_at)
+        )
+        self.scheduler.add(schedule)
+        self.schedules[schedule.id] = schedule
+        self.db.upsert_schedule(
+            {
+                "id": schedule.id,
+                "task_id": schedule.task_id,
+                "run_at": schedule.run_at,
+                "interval": schedule.interval,
+                "enabled": schedule.enabled,
+            }
+        )
+        self.queue.remove(task.id)
+        task.status = "scheduled"
+        self.progress(task)
+        self.status.setText("Download scheduled")
+
+    def _process_schedules(self):
+        now = datetime.now(UTC).timestamp()
+        for schedule in list(self.scheduler.due(now)):
+            task = self.tasks.get(schedule.task_id)
+            if not task:
+                self.scheduler.remove(schedule.id)
+                self.schedules.pop(schedule.id, None)
+                self.db.delete_schedule(schedule.id)
+                continue
+            self.queue.enqueue(task.id, self.priorities.get(task.id, Priority.NORMAL))
+            task.status = "queued"
+            self.progress(task)
+            if schedule.interval:
+                schedule.advance(now)
+                self.db.upsert_schedule(
+                    {
+                        "id": schedule.id,
+                        "task_id": schedule.task_id,
+                        "run_at": schedule.run_at,
+                        "interval": schedule.interval,
+                        "enabled": schedule.enabled,
+                    }
+                )
+            else:
+                self.scheduler.remove(schedule.id)
+                self.schedules.pop(schedule.id, None)
+                self.db.delete_schedule(schedule.id)
+            self._pump_queue()
+
+    def _set_task_status(self, task_id: str, status: str):
+        task = self.tasks.get(task_id)
+        if task:
+            task.status = status
+            self.progress(task)
 
     def _insert_row(self, task_id, name, status, downloaded, total, speed, destination, priority):
         row = self.table.rowCount()
@@ -361,6 +494,8 @@ class MainWindow(QMainWindow):
         return f"{n:.1f} PB"
 
     def closeEvent(self, event):
+        self._schedule_timer.stop()
+        self.scheduler.close()
         self.engine.shutdown()
         self.db.close()
         event.accept()
