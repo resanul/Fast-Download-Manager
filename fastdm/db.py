@@ -53,6 +53,10 @@ class Database:
     def list(self):
         return self.conn.execute("SELECT * FROM downloads ORDER BY created DESC").fetchall()
 
+    def delete_download(self, task_id: str):
+        self.conn.execute("DELETE FROM downloads WHERE id=?", (task_id,))
+        self.conn.commit()
+
     def upsert_schedule(self, schedule: dict):
         self.conn.execute(
             """INSERT INTO schedules(id,task_id,run_at,interval,enabled) VALUES(?,?,?,?,?)
