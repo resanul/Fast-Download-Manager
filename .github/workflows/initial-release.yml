@@ -1,0 +1,55 @@
+name: Initial Public Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/initial-release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pip install -e .
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest
+
+      - name: Build Windows EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Fast-Download-Manager fastdm/__main__.py
+
+      - name: Generate SHA-256
+        shell: powershell
+        run: |
+          $hash = (Get-FileHash dist/Fast-Download-Manager.exe -Algorithm SHA256).Hash
+          "$hash  Fast-Download-Manager.exe" | Out-File -FilePath SHA256SUMS.txt -Encoding ascii
+
+      - name: Publish v0.1.0
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v0.1.0
+          name: Fast Download Manager v0.1.0
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/Fast-Download-Manager.exe
+            SHA256SUMS.txt
