@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import time
 from dataclasses import dataclass, field
@@ -29,6 +28,8 @@ class DownloadTask:
     speed: float = 0.0
     status: str = "queued"
     segments: list[Segment] = field(default_factory=list)
+    created: float = field(default_factory=time.time)
+    error: str | None = None
 
 
 class DownloadEngine:
@@ -69,17 +70,31 @@ class DownloadEngine:
 
     async def download(self, task: DownloadTask, progress=None) -> DownloadTask:
         task.status = "analyzing"
-        meta = await self.analyze(task.url)
-        task.url = meta["url"]
-        task.total = meta["size"]
-        task.status = "downloading"
-        task.destination.parent.mkdir(parents=True, exist_ok=True)
-        if task.total and meta["range"] and task.total >= 4 * 1024 * 1024:
-            await self._segmented(task, progress)
-        else:
-            await self._single(task, progress)
-        task.status = "completed"
-        return task
+        task.error = None
+        try:
+            meta = await self.analyze(task.url)
+            task.url = meta["url"]
+            task.total = meta["size"]
+            task.status = "downloading"
+            task.destination.parent.mkdir(parents=True, exist_ok=True)
+            if task.total and meta["range"] and task.total >= 4 * 1024 * 1024:
+                await self._segmented(task, progress)
+            else:
+                await self._single(task, progress)
+            task.status = "completed"
+            task.speed = 0.0
+            if progress:
+                progress(task)
+            return task
+        except asyncio.CancelledError:
+            task.status = "cancelled"
+            raise
+        except Exception as exc:
+            task.status = "failed"
+            task.error = str(exc)
+            if progress:
+                progress(task)
+            raise
 
     async def _single(self, task: DownloadTask, progress=None):
         temp = task.destination.with_suffix(task.destination.suffix + ".part")
@@ -94,7 +109,8 @@ class DownloadEngine:
                     async with client.stream("GET", task.url) as rr:
                         rr.raise_for_status()
                         await self._write_stream(task, rr, temp, 0, progress)
-                        return
+                    os.replace(temp, task.destination)
+                    return
                 await self._write_stream(task, r, temp, existing, progress)
         os.replace(temp, task.destination)
 
@@ -106,10 +122,14 @@ class DownloadEngine:
             async for chunk in response.aiter_bytes(self.chunk_size):
                 while task.id in self._pause:
                     task.status = "paused"
+                    if progress:
+                        progress(task)
                     await asyncio.sleep(0.2)
                 if task.id in self._cancel:
                     raise asyncio.CancelledError
+                task.status = "downloading"
                 f.write(chunk)
+                f.flush()
                 done += len(chunk)
                 task.downloaded = done
                 elapsed = max(time.monotonic() - started, 0.001)
@@ -125,12 +145,13 @@ class DownloadEngine:
         tempdir.mkdir(exist_ok=True)
         task.segments = [Segment(i * size, total - 1 if i == n - 1 else (i + 1) * size - 1) for i in range(n)]
         lock = asyncio.Lock()
+
         async def worker(i, seg):
             part = tempdir / f"{i:04d}.part"
-            have = part.stat().st_size if part.exists() else 0
+            have = min(part.stat().st_size if part.exists() else 0, seg.end - seg.start + 1)
+            seg.downloaded = have
             start = seg.start + have
             if start > seg.end:
-                seg.downloaded = seg.end - seg.start + 1
                 seg.complete = True
                 return
             headers = {"Range": f"bytes={start}-{seg.end}"}
@@ -144,10 +165,14 @@ class DownloadEngine:
                                 async for chunk in r.aiter_bytes(self.chunk_size):
                                     while task.id in self._pause:
                                         task.status = "paused"
+                                        if progress:
+                                            progress(task)
                                         await asyncio.sleep(0.2)
                                     if task.id in self._cancel:
                                         raise asyncio.CancelledError
+                                    task.status = "downloading"
                                     f.write(chunk)
+                                    f.flush()
                                     have += len(chunk)
                                     seg.downloaded = have
                                     async with lock:
@@ -162,6 +187,7 @@ class DownloadEngine:
                         if attempt == 4:
                             raise
                         await asyncio.sleep(2 ** attempt)
+
         await asyncio.gather(*(worker(i, s) for i, s in enumerate(task.segments)))
         with task.destination.with_suffix(task.destination.suffix + ".part").open("wb") as out:
             for i in range(n):
