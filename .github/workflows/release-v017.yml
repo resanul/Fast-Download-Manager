@@ -1,0 +1,78 @@
+name: Publish Fast Download Manager v0.1.7
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-v017.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pip install -e .
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest
+
+      - name: Qt startup smoke test
+        shell: powershell
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -c "import tempfile; from pathlib import Path; from PySide6.QtWidgets import QApplication; from shiboken6 import isValid; from fastdm.ui import MainWindow; app=QApplication([]); MainWindow._db_path=staticmethod(lambda: Path(tempfile.mkdtemp())/'startup.db'); w=MainWindow(); app.processEvents(); assert isValid(w.sidebar); assert isValid(w.nav_status); w.set_filter('all'); assert isValid(w.nav_status); assert w.nav_status.text().startswith('Showing'); w._force_exit=True; w.close(); app.processEvents(); print('Qt startup smoke test passed')"
+
+      - name: Build Windows EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Fast-Download-Manager fastdm/__main__.py
+
+      - name: Verify EXE startup
+        shell: powershell
+        run: |
+          $exe = Join-Path $PWD 'dist/Fast-Download-Manager.exe'
+          if (-not (Test-Path $exe)) { throw 'EXE was not generated' }
+          $size = (Get-Item $exe).Length
+          if ($size -lt 1000000) { throw "EXE unexpectedly small: $size bytes" }
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 5
+          if ($p.HasExited -and $p.ExitCode -ne 0) { throw "EXE exited during startup with code $($p.ExitCode)" }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Write-Host "Windows EXE startup verified: $size bytes"
+
+      - name: Generate SHA-256
+        shell: powershell
+        run: |
+          $hash = (Get-FileHash dist/Fast-Download-Manager.exe -Algorithm SHA256).Hash
+          "$hash  Fast-Download-Manager.exe" | Out-File SHA256SUMS.txt -Encoding ascii
+
+      - name: Publish v0.1.7
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.7
+          name: Fast Download Manager v0.1.7
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/Fast-Download-Manager.exe
+            SHA256SUMS.txt
