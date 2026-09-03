@@ -8,12 +8,14 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -22,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from .db import Database
 from .engine import DownloadEngine, DownloadTask
+from .queue import DownloadQueue, Priority
 
 
 class Worker(QObject):
@@ -52,10 +55,12 @@ class MainWindow(QMainWindow):
         self.resize(1200, 760)
         self.engine = DownloadEngine()
         self.db = Database(self._db_path())
+        self.queue = DownloadQueue(max_concurrent=3)
         self.rows: dict[str, int] = {}
         self.tasks: dict[str, DownloadTask] = {}
         self.workers: dict[str, Worker] = {}
         self.threads: dict[str, QThread] = {}
+        self.priorities: dict[str, Priority] = {}
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -70,6 +75,11 @@ class MainWindow(QMainWindow):
         self.url.setPlaceholderText("Paste a download URL…")
         self.url.returnPressed.connect(self.add_download)
         bar.addWidget(self.url, 1)
+        self.priority = QComboBox()
+        self.priority.addItem("High", Priority.HIGH)
+        self.priority.addItem("Normal", Priority.NORMAL)
+        self.priority.addItem("Low", Priority.LOW)
+        bar.addWidget(self.priority)
         add = QPushButton("+ Add Download")
         add.clicked.connect(self.add_download)
         bar.addWidget(add)
@@ -86,26 +96,35 @@ class MainWindow(QMainWindow):
             button = QPushButton(label)
             button.clicked.connect(callback)
             controls.addWidget(button)
+        controls.addWidget(QLabel("Max concurrent:"))
+        self.concurrency = QSpinBox()
+        self.concurrency.setRange(1, 8)
+        self.concurrency.setValue(3)
+        self.concurrency.valueChanged.connect(self.set_concurrency)
+        controls.addWidget(self.concurrency)
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["File", "Status", "Progress", "Speed", "Size", "Destination"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["File", "Status", "Progress", "Speed", "Size", "Priority", "Destination"]
+        )
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
-        self.status = QLabel("Ready")
+        self.status = QLabel("Ready · Queue 0 · Active 0/3")
         layout.addWidget(self.status)
         self.setStyleSheet(
             "QMainWindow{background:#101318;color:#eee}"
             "QLabel#title{font-size:28px;font-weight:700;margin:12px}"
-            "QLineEdit,QTableWidget{background:#181c23;color:#eee;border:1px solid #303744;border-radius:8px;padding:8px}"
+            "QLineEdit,QTableWidget,QComboBox,QSpinBox{background:#181c23;color:#eee;border:1px solid #303744;border-radius:8px;padding:8px}"
             "QPushButton{background:#2563eb;color:white;border:0;border-radius:8px;padding:10px 16px;font-weight:600}"
             "QHeaderView::section{background:#222733;color:#bbb;padding:8px}"
         )
         self.load_history()
+        self._update_queue_status()
 
     @staticmethod
     def _db_path() -> Path:
@@ -124,10 +143,11 @@ class MainWindow(QMainWindow):
                 item["total"],
                 item["speed"],
                 item["destination"],
+                Priority.NORMAL,
             )
             self.rows[item["id"]] = row
 
-    def _insert_row(self, task_id, name, status, downloaded, total, speed, destination):
+    def _insert_row(self, task_id, name, status, downloaded, total, speed, destination, priority):
         row = self.table.rowCount()
         self.table.insertRow(row)
         values = [
@@ -136,6 +156,7 @@ class MainWindow(QMainWindow):
             self._percent(downloaded, total),
             f"{speed / 1048576:.2f} MB/s" if speed else "0.00 MB/s",
             self.fmt(total),
+            priority.name.title(),
             destination,
         ]
         for col, value in enumerate(values):
@@ -152,13 +173,35 @@ class MainWindow(QMainWindow):
             return
         name = Path(url.split("?", 1)[0]).name or "download"
         task = DownloadTask(uuid.uuid4().hex, url, Path(folder) / name)
+        priority = Priority(self.priority.currentData())
         self.tasks[task.id] = task
+        self.priorities[task.id] = priority
         self.rows[task.id] = self._insert_row(
-            task.id, name, "queued", 0, None, 0, str(task.destination)
+            task.id, name, "queued", 0, None, 0, str(task.destination), priority
         )
+        self.queue.enqueue(task.id, priority)
         self._save(task)
         self.url.clear()
-        self._start(task)
+        self._pump_queue()
+
+    def set_concurrency(self, value: int):
+        self.queue.max_concurrent = max(1, value)
+        self._pump_queue()
+        self._update_queue_status()
+
+    def _pump_queue(self):
+        while self.queue.active_count < self.queue.max_concurrent:
+            item = self.queue.next_ready()
+            if not item or not self.queue.mark_started(item.task_id):
+                break
+            task = self.tasks.get(item.task_id)
+            if not task:
+                self.queue.mark_finished(item.task_id)
+                continue
+            task.status = "queued"
+            self.progress(task)
+            self._start(task)
+        self._update_queue_status()
 
     def _start(self, task: DownloadTask):
         thread = QThread(self)
@@ -191,12 +234,16 @@ class MainWindow(QMainWindow):
         self.table.item(row, 3).setText(f"{task.speed / 1048576:.2f} MB/s")
         self.table.item(row, 4).setText(self.fmt(total))
         self._save(task)
+        self._update_queue_status()
 
     def done(self, task: DownloadTask):
+        self.queue.mark_finished(task.id)
         self.progress(task)
         self.status.setText(f"Download {task.status}")
+        self._pump_queue()
 
     def fail(self, task_id: str, error: str):
+        self.queue.mark_finished(task_id)
         task = self.tasks.get(task_id)
         if task:
             task.status = "failed"
@@ -204,6 +251,7 @@ class MainWindow(QMainWindow):
             self._save(task)
             self.progress(task)
         self.status.setText("Download failed: " + error)
+        self._pump_queue()
 
     def _selected_task(self):
         selected = self.table.selectionModel().selectedRows()
@@ -242,9 +290,10 @@ class MainWindow(QMainWindow):
         if task and task.status in {"failed", "cancelled"}:
             self.engine.resume(task.id)
             self.engine._cancel.discard(task.id)
+            self.queue.enqueue(task.id, self.priorities.get(task.id, Priority.NORMAL))
             task.status = "queued"
             self.progress(task)
-            self._start(task)
+            self._pump_queue()
 
     def open_folder_selected(self):
         task = self._selected_task()
@@ -252,6 +301,11 @@ class MainWindow(QMainWindow):
             return
         import os
         os.startfile(task.destination.parent) if sys.platform == "win32" else None
+
+    def _update_queue_status(self):
+        self.status.setText(
+            f"Queue {self.queue.pending_count} · Active {self.queue.active_count}/{self.queue.max_concurrent}"
+        )
 
     def _save(self, task: DownloadTask):
         self.db.upsert(
