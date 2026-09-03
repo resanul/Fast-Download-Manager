@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
         self.nav_status = QLabel("Ready")
         self.nav_status.setObjectName("navStatus")
         side.addWidget(self.nav_status)
-        main.addWidget(side)
+        main.addLayout(side)
 
         content = QFrame()
         content.setObjectName("content")
