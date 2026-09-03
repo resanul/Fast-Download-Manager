@@ -215,7 +215,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(24, 20, 24, 18)
         layout.setSpacing(14)
-
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title = QLabel("Downloads")
@@ -232,9 +231,6 @@ class MainWindow(QMainWindow):
         self.search.setFixedWidth(280)
         self.search.textChanged.connect(self._apply_filters)
         header.addWidget(self.search)
-        settings = QPushButton("Settings")
-        settings.clicked.connect(self._show_settings_message)
-        header.addWidget(settings)
         layout.addLayout(header)
 
         action = QHBoxLayout()
@@ -275,13 +271,7 @@ class MainWindow(QMainWindow):
         tabs = QHBoxLayout()
         tabs.setSpacing(2)
         self.filter_buttons = {}
-        for key, label in (
-            ("all", "All"),
-            ("active", "Active"),
-            ("completed", "Completed"),
-            ("queued", "Queued"),
-            ("failed", "Errors"),
-        ):
+        for key, label in (("all", "All"), ("active", "Active"), ("completed", "Completed"), ("queued", "Queued"), ("failed", "Errors")):
             btn = QPushButton(label)
             btn.setObjectName("tabButton")
             btn.setCheckable(True)
@@ -296,9 +286,7 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 7)
         self.table.setObjectName("downloadsTable")
-        self.table.setHorizontalHeaderLabels(
-            ["File", "Progress", "Size", "Status", "Speed", "Queue", "Actions"]
-        )
+        self.table.setHorizontalHeaderLabels(["File", "Progress", "Size", "Status", "Speed", "Queue", "Actions"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -307,12 +295,8 @@ class MainWindow(QMainWindow):
         header_view = self.table.horizontalHeader()
         header_view.setStretchLastSection(False)
         header_view.setSectionResizeMode(0, header_view.ResizeMode.Stretch)
-        header_view.setSectionResizeMode(1, header_view.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(2, header_view.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(3, header_view.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(4, header_view.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(5, header_view.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(6, header_view.ResizeMode.ResizeToContents)
+        for index in range(1, 7):
+            header_view.setSectionResizeMode(index, header_view.ResizeMode.ResizeToContents)
         layout.addWidget(self.table, 1)
 
         footer = QHBoxLayout()
@@ -391,10 +375,7 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def _tray_activated(self, reason):
-        if reason in {
-            QSystemTrayIcon.ActivationReason.Trigger,
-            QSystemTrayIcon.ActivationReason.DoubleClick,
-        }:
+        if reason in {QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick}:
             self._restore_from_tray()
 
     def _restore_from_tray(self):
@@ -417,17 +398,10 @@ class MainWindow(QMainWindow):
             button.setChecked(name == key)
             button.blockSignals(False)
         labels = {
-            "all": "All downloads",
-            "active": "Active downloads",
-            "completed": "Completed downloads",
-            "queued": "Queued downloads",
-            "paused": "Paused downloads",
-            "failed": "Failed downloads",
-            "scheduled": "Scheduled downloads",
-            "documents": "Documents",
-            "archives": "Compressed files",
-            "music": "Music",
-            "videos": "Videos",
+            "all": "All downloads", "active": "Active downloads", "completed": "Completed downloads",
+            "queued": "Queued downloads", "paused": "Paused downloads", "failed": "Failed downloads",
+            "scheduled": "Scheduled downloads", "documents": "Documents", "archives": "Compressed files",
+            "music": "Music", "videos": "Videos",
         }
         self.filter_hint.setText(labels.get(key, "All downloads"))
         self._apply_filters()
@@ -439,13 +413,9 @@ class MainWindow(QMainWindow):
             task = self.tasks.get(task_id)
             if not task:
                 continue
-            status_match = self._status_matches(task)
-            name = task.destination.name.lower()
-            query_match = not query or query in name or query in task.url.lower()
-            show = status_match and query_match
+            show = self._status_matches(task) and (not query or query in task.destination.name.lower() or query in task.url.lower())
             self.table.setRowHidden(row, not show)
-            if show:
-                visible += 1
+            visible += int(show)
         self.nav_status.setText(f"Showing {visible} download{'s' if visible != 1 else ''}")
 
     def _status_matches(self, task: DownloadTask) -> bool:
@@ -482,38 +452,22 @@ class MainWindow(QMainWindow):
                 priority = Priority.NORMAL
             status = item["status"]
             if status in {"queued", "paused", "analyzing", "downloading"}:
-                task = DownloadTask(
-                    item["id"], item["url"], Path(item["destination"]),
-                    total=item["total"], downloaded=item["downloaded"] or 0,
-                    status="queued", created=item["created"],
-                )
+                task = DownloadTask(item["id"], item["url"], Path(item["destination"]), total=item["total"], downloaded=item["downloaded"] or 0, status="queued", created=item["created"])
                 self.tasks[task.id] = task
                 self.priorities[task.id] = priority
                 self.queue.enqueue(task.id, priority)
                 status = "queued"
             elif status == "scheduled":
-                task = DownloadTask(
-                    item["id"], item["url"], Path(item["destination"]),
-                    total=item["total"], downloaded=item["downloaded"] or 0,
-                    status="scheduled", created=item["created"],
-                )
+                task = DownloadTask(item["id"], item["url"], Path(item["destination"]), total=item["total"], downloaded=item["downloaded"] or 0, status="scheduled", created=item["created"])
                 self.tasks[task.id] = task
                 self.priorities[task.id] = priority
-            row = self._insert_row(
-                item["id"], item["filename"], status,
-                item["downloaded"], item["total"], item["speed"],
-                item["destination"], priority,
-            )
+            row = self._insert_row(item["id"], item["filename"], status, item["downloaded"], item["total"], item["speed"], item["destination"], priority)
             self.rows[item["id"]] = row
         self._apply_filters()
 
     def load_schedules(self):
         for item in self.db.list_schedules():
-            schedule = Schedule(
-                item["id"], item["task_id"], float(item["run_at"]),
-                float(item["interval"]) if item["interval"] is not None else None,
-                bool(item["enabled"]),
-            )
+            schedule = Schedule(item["id"], item["task_id"], float(item["run_at"]), float(item["interval"]) if item["interval"] is not None else None, bool(item["enabled"]))
             if schedule.task_id in self.tasks and schedule.enabled:
                 self.scheduler.add(schedule)
                 self.schedules[schedule.id] = schedule
@@ -534,10 +488,7 @@ class MainWindow(QMainWindow):
         schedule = Schedule.recurring(task.id, run_at, interval) if interval else Schedule.once(task.id, run_at)
         self.scheduler.add(schedule)
         self.schedules[schedule.id] = schedule
-        self.db.upsert_schedule({
-            "id": schedule.id, "task_id": schedule.task_id, "run_at": schedule.run_at,
-            "interval": schedule.interval, "enabled": schedule.enabled,
-        })
+        self.db.upsert_schedule({"id": schedule.id, "task_id": schedule.task_id, "run_at": schedule.run_at, "interval": schedule.interval, "enabled": schedule.enabled})
         self.queue.remove(task.id)
         task.status = "scheduled"
         self.progress(task)
@@ -559,10 +510,7 @@ class MainWindow(QMainWindow):
             self._notify("Scheduled download started", task.destination.name)
             if schedule.interval:
                 schedule.advance(now)
-                self.db.upsert_schedule({
-                    "id": schedule.id, "task_id": schedule.task_id, "run_at": schedule.run_at,
-                    "interval": schedule.interval, "enabled": schedule.enabled,
-                })
+                self.db.upsert_schedule({"id": schedule.id, "task_id": schedule.task_id, "run_at": schedule.run_at, "interval": schedule.interval, "enabled": schedule.enabled})
             else:
                 self.scheduler.remove(schedule.id)
                 self.schedules.pop(schedule.id, None)
@@ -596,11 +544,7 @@ class MainWindow(QMainWindow):
         action_widget = QWidget()
         action_layout = QHBoxLayout(action_widget)
         action_layout.setContentsMargins(4, 0, 4, 0)
-        for symbol, tooltip, callback in (
-            ("Ⅱ", "Pause", self._row_pause),
-            ("▶", "Resume", self._row_resume),
-            ("×", "Cancel", self._row_cancel),
-        ):
+        for symbol, tooltip, callback in (("Ⅱ", "Pause", self._row_pause), ("▶", "Resume", self._row_resume), ("×", "Cancel", self._row_cancel)):
             btn = QPushButton(symbol)
             btn.setToolTip(tooltip)
             btn.setFixedWidth(34)
@@ -611,19 +555,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _pretty_status(status: str) -> str:
-        return {
-            "downloading": "Downloading",
-            "completed": "Completed",
-            "queued": "Queued",
-            "paused": "Paused",
-            "failed": "Error",
-            "scheduled": "Scheduled",
-            "cancelled": "Cancelled",
-            "analyzing": "Analyzing",
-        }.get(status, status.title())
+        return {"downloading": "Downloading", "completed": "Completed", "queued": "Queued", "paused": "Paused", "failed": "Error", "scheduled": "Scheduled", "cancelled": "Cancelled", "analyzing": "Analyzing"}.get(status, status.title())
 
     def add_download(self):
-        url = self.search.text().strip() if False else ""
         self._prompt_url()
 
     def _prompt_url(self):
@@ -655,10 +589,11 @@ class MainWindow(QMainWindow):
             return
         name = Path(url.split("?", 1)[0]).name or "download"
         task = DownloadTask(uuid.uuid4().hex, url, Path(folder) / name)
+        priority = Priority(priority)
         self.tasks[task.id] = task
-        self.priorities[task.id] = Priority(priority)
-        self.rows[task.id] = self._insert_row(task.id, name, "queued", 0, None, 0, str(task.destination), Priority(priority))
-        self.queue.enqueue(task.id, Priority(priority))
+        self.priorities[task.id] = priority
+        self.rows[task.id] = self._insert_row(task.id, name, "queued", 0, None, 0, str(task.destination), priority)
+        self.queue.enqueue(task.id, priority)
         self._save(task)
         self._apply_filters()
         self._pump_queue()
@@ -808,9 +743,7 @@ class MainWindow(QMainWindow):
             os.startfile(task.destination.parent)
 
     def _update_queue_status(self):
-        self.status.setText(
-            f"Queue {self.queue.pending_count} · Active {self.queue.active_count}/{self.queue.max_concurrent}"
-        )
+        self.status.setText(f"Queue {self.queue.pending_count} · Active {self.queue.active_count}/{self.queue.max_concurrent}")
 
     def _refresh_stats(self):
         total = len(self.tasks)
@@ -832,18 +765,7 @@ class MainWindow(QMainWindow):
         return f"{value:.1f} GB/s"
 
     def _save(self, task: DownloadTask):
-        self.db.upsert({
-            "id": task.id,
-            "url": task.url,
-            "filename": task.destination.name,
-            "destination": str(task.destination),
-            "total": task.total,
-            "downloaded": task.downloaded,
-            "status": task.status,
-            "speed": task.speed,
-            "created": task.created,
-            "priority": int(self.priorities.get(task.id, Priority.NORMAL)),
-        })
+        self.db.upsert({"id": task.id, "url": task.url, "filename": task.destination.name, "destination": str(task.destination), "total": task.total, "downloaded": task.downloaded, "status": task.status, "speed": task.speed, "created": task.created, "priority": int(self.priorities.get(task.id, Priority.NORMAL))})
 
     @staticmethod
     def _percent(done, total):
