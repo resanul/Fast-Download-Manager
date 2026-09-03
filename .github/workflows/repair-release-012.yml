@@ -29,7 +29,7 @@ jobs:
           pip install -e .
 
       - name: Lint
-        run: ruff check . --ignore=SIM117
+        run: ruff check .
 
       - name: Test
         run: pytest
@@ -54,11 +54,11 @@ jobs:
           $hash = (Get-FileHash dist/Fast-Download-Manager.exe -Algorithm SHA256).Hash
           "$hash  Fast-Download-Manager.exe" | Out-File -FilePath SHA256SUMS.txt -Encoding ascii
 
-      - name: Publish v0.1.4
+      - name: Publish v0.1.5
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.4
-          name: Fast Download Manager v0.1.4
+          tag_name: v0.1.5
+          name: Fast Download Manager v0.1.5
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
           fail_on_unmatched_files: true
