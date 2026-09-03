@@ -25,9 +25,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
-    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
