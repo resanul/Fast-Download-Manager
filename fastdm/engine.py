@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,7 +22,7 @@ class Segment:
 
 @dataclass
 class SpeedMeter:
-    """Tracks instantaneous, average, and peak throughput from byte deltas."""
+    """Tracks rolling and aggregate download throughput."""
 
     baseline_bytes: int = 0
     baseline_time: float = field(default_factory=time.monotonic)
@@ -44,15 +45,11 @@ class SpeedMeter:
         elapsed = now - self.last_time
         delta = max(0, bytes_done - self.last_bytes)
         if delta > 0:
-            sample_elapsed = min(max(elapsed, 0.001), 2.0)
-            self.speed = delta / sample_elapsed
-            self.peak = max(self.peak, self.speed)
+            sample = delta / max(elapsed, 0.001)
+            self.speed = sample
+            self.peak = max(self.peak, sample)
             self.last_bytes = bytes_done
             self.last_time = now
-        elif bytes_done < self.last_bytes:
-            self.last_bytes = bytes_done
-            self.last_time = now
-            self.speed = 0.0
         elif elapsed >= 2.0:
             self.speed = 0.0
         return self.speed
@@ -70,6 +67,7 @@ class DownloadTask:
     total: int | None = None
     downloaded: int = 0
     speed: float = 0.0
+    peak_speed: float = 0.0
     status: str = "queued"
     segments: list[Segment] = field(default_factory=list)
     created: float = field(default_factory=time.time)
@@ -77,121 +75,127 @@ class DownloadTask:
     checksum_algorithm: str | None = None
     expected_checksum: str | None = None
     actual_checksum: str | None = None
-    speed_started: float = 0.0
-    speed_baseline: int = 0
     speed_meter: SpeedMeter = field(default_factory=SpeedMeter, repr=False)
-    peak_speed: float = 0.0
 
 
 class DownloadEngine:
-    """Async HTTP downloader with range-aware segmented downloads and recovery."""
+    """HTTP/HTTPS downloader with collision-safe resumable workspaces."""
 
     def __init__(self, connections: int = 8, chunk_size: int = 256 * 1024, retries: int = 5):
         self.connections = max(1, min(connections, 32))
         self.chunk_size = max(64 * 1024, chunk_size)
         self.retries = max(1, min(retries, 10))
-        self._tasks: dict[str, asyncio.Task] = {}
-        self._pause: set[str] = set()
         self._cancel: set[str] = set()
+        self._pause: set[str] = set()
+
+    @staticmethod
+    def _workspace(task: DownloadTask) -> Path:
+        return task.destination.parent / ".fastdm" / task.id
 
     async def analyze(self, url: str) -> dict:
-        p = urlparse(url)
-        if p.scheme not in {"http", "https"} or not p.netloc:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("Only valid HTTP/HTTPS URLs are supported")
+
         async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-            r = await client.head(url)
-            if r.status_code >= 400:
-                r = await client.get(url, headers={"Range": "bytes=0-0"})
-            length = r.headers.get("content-length")
-            cr = r.headers.get("content-range", "")
-            if not length and "/" in cr:
-                length = cr.rsplit("/", 1)[-1]
-            cd = r.headers.get("content-disposition", "")
-            name = Path(urlparse(str(r.url)).path).name or Path(p.path).name or "download"
-            if "filename=" in cd:
-                name = cd.split("filename=", 1)[1].strip(' \";') or name
+            response = await client.head(url)
+            if response.status_code >= 400:
+                response = await client.get(url, headers={"Range": "bytes=0-0"})
+            content_range = response.headers.get("content-range", "")
+            length = response.headers.get("content-length")
+            if (not length or not length.isdigit()) and "/" in content_range:
+                length = content_range.rsplit("/", 1)[-1]
+            filename = Path(urlparse(str(response.url)).path).name or "download"
+            disposition = response.headers.get("content-disposition", "")
+            if "filename=" in disposition:
+                candidate = disposition.split("filename=", 1)[1].strip(' \";\t')
+                if candidate:
+                    filename = candidate
             return {
-                "url": str(r.url),
-                "filename": name,
+                "url": str(response.url),
+                "filename": filename,
                 "size": int(length) if length and length.isdigit() else None,
-                "mime": r.headers.get("content-type", "application/octet-stream"),
-                "range": r.headers.get("accept-ranges", "").lower() == "bytes" or r.status_code == 206,
-                "etag": r.headers.get("etag"),
-                "last_modified": r.headers.get("last-modified"),
+                "mime": response.headers.get("content-type", "application/octet-stream"),
+                "range": response.status_code == 206
+                or response.headers.get("accept-ranges", "").lower() == "bytes",
+                "etag": response.headers.get("etag"),
+                "last_modified": response.headers.get("last-modified"),
             }
 
     async def download(self, task: DownloadTask, progress=None) -> DownloadTask:
         self._cancel.discard(task.id)
+        self._pause.discard(task.id)
         task.status = "analyzing"
         task.error = None
-        task.speed = 0.0
-        task.speed_started = time.monotonic()
-        task.speed_baseline = task.downloaded
         task.speed_meter.reset(task.downloaded)
-        task.peak_speed = 0.0
         try:
-            meta = await self.analyze(task.url)
-            task.url = meta["url"]
-            task.total = meta["size"]
+            metadata = await self.analyze(task.url)
+            task.url = metadata["url"]
+            task.total = metadata["size"]
             task.status = "downloading"
             task.destination.parent.mkdir(parents=True, exist_ok=True)
-            if task.total and meta["range"] and task.total >= 4 * 1024 * 1024:
+            if task.total and metadata["range"] and task.total >= 4 * 1024 * 1024:
                 await self._segmented(task, progress)
             else:
                 await self._single(task, progress)
             if task.checksum_algorithm and task.expected_checksum:
-                task.actual_checksum = await asyncio.to_thread(
+                actual = await asyncio.to_thread(
                     self._hash_file, task.destination, task.checksum_algorithm
                 )
-                if task.actual_checksum.lower() != task.expected_checksum.lower():
+                task.actual_checksum = actual
+                if actual.lower() != task.expected_checksum.lower():
                     task.destination.unlink(missing_ok=True)
                     raise RuntimeError("Checksum verification failed")
-            task.status = "completed"
             task.speed = 0.0
+            task.status = "completed"
             if progress:
                 progress(task)
             return task
         except asyncio.CancelledError:
-            task.status = "cancelled"
             task.speed = 0.0
+            task.status = "cancelled"
             if progress:
                 progress(task)
             raise
         except Exception as exc:
-            task.status = "failed"
             task.speed = 0.0
+            task.status = "failed"
             task.error = str(exc)
             if progress:
                 progress(task)
             raise
 
-    async def _single(self, task: DownloadTask, progress=None):
-        temp = task.destination.with_suffix(task.destination.suffix + ".part")
-        existing = temp.stat().st_size if temp.exists() else 0
+    async def _single(self, task: DownloadTask, progress=None) -> None:
+        workspace = self._workspace(task)
+        workspace.mkdir(parents=True, exist_ok=True)
+        temp = workspace / "download.part"
+        existing = min(temp.stat().st_size if temp.exists() else 0, task.total or 2**63 - 1)
         task.downloaded = existing
-        task.speed_baseline = existing
         task.speed_meter.reset(existing)
+
         for attempt in range(self.retries):
             try:
                 headers = {"Range": f"bytes={existing}-"} if existing else {}
-                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client, client.stream(
-                    "GET", task.url, headers=headers
-                ) as r:
-                    r.raise_for_status()
-                    if existing and r.status_code != 206:
-                        existing = 0
-                        task.downloaded = 0
-                        task.speed_baseline = 0
-                        task.speed_meter.reset(0)
-                        temp.unlink(missing_ok=True)
-                        continue
-                    await self._write_stream(task, r, temp, existing, progress)
+                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+                    async with client.stream("GET", task.url, headers=headers) as response:
+                        response.raise_for_status()
+                        if existing and response.status_code != 206:
+                            existing = 0
+                            temp.unlink(missing_ok=True)
+                            task.downloaded = 0
+                            task.speed_meter.reset(0)
+                            continue
+                        await self._write_stream(task, response, temp, existing, progress)
+
                 if task.total is None:
                     task.total = temp.stat().st_size
-                if task.total is None or temp.stat().st_size == task.total:
-                    os.replace(temp, task.destination)
-                    return
-                raise RuntimeError("Downloaded file size does not match expected size")
+                if temp.stat().st_size != task.total:
+                    raise RuntimeError(
+                        f"Downloaded size mismatch: expected {task.total}, got {temp.stat().st_size}"
+                    )
+                os.replace(temp, task.destination)
+                shutil.rmtree(workspace, ignore_errors=True)
+                return
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -201,88 +205,93 @@ class DownloadEngine:
                 existing = temp.stat().st_size if temp.exists() else 0
         raise RuntimeError("Download failed")
 
-    async def _write_stream(self, task, response, path, initial, progress):
+    async def _write_stream(self, task, response, path: Path, initial: int, progress) -> None:
         mode = "ab" if initial else "wb"
-        done = initial
-        with path.open(mode) as f:
+        with path.open(mode) as output:
             async for chunk in response.aiter_bytes(self.chunk_size):
                 while task.id in self._pause:
                     task.status = "paused"
-                    task.speed = max(task.speed_meter.speed, task.speed_meter.average(done))
+                    task.speed = task.speed_meter.speed
                     if progress:
                         progress(task)
                     await asyncio.sleep(0.2)
                 if task.id in self._cancel:
                     raise asyncio.CancelledError
                 task.status = "downloading"
-                f.write(chunk)
-                f.flush()
-                done += len(chunk)
-                task.downloaded = done
-                self._update_speed(task)
+                output.write(chunk)
+                output.flush()
+                task.downloaded = output.tell() if not initial else initial + output.tell()
+                task.speed = self._update_speed(task)
+                task.peak_speed = max(task.peak_speed, task.speed)
                 if progress:
                     progress(task)
 
-    async def _segmented(self, task, progress):
-        total = int(task.total)
-        n = min(self.connections, max(2, total // (8 * 1024 * 1024)))
-        size = total // n
-        tempdir = task.destination.parent / (task.destination.name + ".segments")
-        tempdir.mkdir(exist_ok=True)
+    async def _segmented(self, task: DownloadTask, progress=None) -> None:
+        total = int(task.total or 0)
+        connections = min(self.connections, max(2, total // (8 * 1024 * 1024)))
+        segment_size = total // connections
+        workspace = self._workspace(task)
+        workspace.mkdir(parents=True, exist_ok=True)
         task.segments = [
-            Segment(i * size, total - 1 if i == n - 1 else (i + 1) * size - 1)
-            for i in range(n)
+            Segment(
+                i * segment_size,
+                total - 1 if i == connections - 1 else (i + 1) * segment_size - 1,
+            )
+            for i in range(connections)
         ]
-        initial_total = 0
-        for i, seg in enumerate(task.segments):
-            part = tempdir / f"{i:04d}.part"
-            have = min(part.stat().st_size if part.exists() else 0, seg.end - seg.start + 1)
-            seg.downloaded = have
-            initial_total += have
-        task.downloaded = initial_total
-        task.speed_baseline = initial_total
-        task.speed_started = time.monotonic()
-        task.speed_meter.reset(initial_total)
-        task.peak_speed = 0.0
+
+        for i, segment in enumerate(task.segments):
+            part = workspace / f"segment-{i:04d}.part"
+            segment.downloaded = min(
+                part.stat().st_size if part.exists() else 0,
+                segment.end - segment.start + 1,
+            )
+
+        task.downloaded = sum(segment.downloaded for segment in task.segments)
+        task.speed_meter.reset(task.downloaded)
         lock = asyncio.Lock()
 
-        async def worker(i, seg):
-            part = tempdir / f"{i:04d}.part"
-            have = seg.downloaded
-            start = seg.start + have
-            if start > seg.end:
-                seg.complete = True
+        async def worker(index: int, segment: Segment) -> None:
+            part = workspace / f"segment-{index:04d}.part"
+            have = segment.downloaded
+            start = segment.start + have
+            if start > segment.end:
+                segment.complete = True
                 return
+
             async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
                 for attempt in range(self.retries):
                     try:
-                        headers = {"Range": f"bytes={start}-{seg.end}"}
-                        async with client.stream("GET", task.url, headers=headers) as r:
-                            if r.status_code != 206:
-                                raise RuntimeError("Server did not honor Range request")
-                            with part.open("ab" if have else "wb") as f:
-                                async for chunk in r.aiter_bytes(self.chunk_size):
+                        headers = {"Range": f"bytes={start}-{segment.end}"}
+                        async with client.stream("GET", task.url, headers=headers) as response:
+                            if response.status_code != 206:
+                                raise RuntimeError(
+                                    f"Server did not honor Range request (HTTP {response.status_code})"
+                                )
+                            with part.open("ab" if have else "wb") as output:
+                                async for chunk in response.aiter_bytes(self.chunk_size):
                                     while task.id in self._pause:
                                         task.status = "paused"
-                                        task.speed = max(task.speed_meter.speed, task.speed_meter.average(task.downloaded))
+                                        task.speed = task.speed_meter.speed
                                         if progress:
                                             progress(task)
                                         await asyncio.sleep(0.2)
                                     if task.id in self._cancel:
                                         raise asyncio.CancelledError
                                     task.status = "downloading"
-                                    f.write(chunk)
-                                    f.flush()
+                                    output.write(chunk)
+                                    output.flush()
                                     have += len(chunk)
-                                    seg.downloaded = have
+                                    segment.downloaded = have
                                     async with lock:
                                         task.downloaded = sum(s.downloaded for s in task.segments)
-                                        self._update_speed(task)
+                                        task.speed = self._update_speed(task)
+                                        task.peak_speed = max(task.peak_speed, task.speed)
                                     if progress:
                                         progress(task)
-                            if have != seg.end - seg.start + 1:
+                            if have != segment.end - segment.start + 1:
                                 raise RuntimeError("Segment size mismatch")
-                            seg.complete = True
+                            segment.complete = True
                             return
                     except asyncio.CancelledError:
                         raise
@@ -290,26 +299,32 @@ class DownloadEngine:
                         if attempt == self.retries - 1:
                             raise
                         await asyncio.sleep(2**attempt)
-                        have = min(part.stat().st_size if part.exists() else 0, seg.end - seg.start + 1)
-                        start = seg.start + have
+                        have = min(
+                            part.stat().st_size if part.exists() else 0,
+                            segment.end - segment.start + 1,
+                        )
+                        start = segment.start + have
 
-        await asyncio.gather(*(worker(i, s) for i, s in enumerate(task.segments)))
-        with task.destination.with_suffix(task.destination.suffix + ".part").open("wb") as out:
-            for i in range(n):
-                part = tempdir / f"{i:04d}.part"
-                with part.open("rb") as src:
-                    while chunk := src.read(self.chunk_size):
-                        out.write(chunk)
-        os.replace(task.destination.with_suffix(task.destination.suffix + ".part"), task.destination)
-        for p in tempdir.glob("*.part"):
-            p.unlink(missing_ok=True)
-        tempdir.rmdir()
+        await asyncio.gather(*(worker(i, segment) for i, segment in enumerate(task.segments)))
+
+        output_temp = workspace / "assembled.part"
+        with output_temp.open("wb") as output:
+            for i in range(connections):
+                part = workspace / f"segment-{i:04d}.part"
+                with part.open("rb") as source:
+                    while chunk := source.read(self.chunk_size):
+                        output.write(chunk)
+
+        if output_temp.stat().st_size != total:
+            raise RuntimeError("Assembled file size mismatch")
+        os.replace(output_temp, task.destination)
+        shutil.rmtree(workspace, ignore_errors=True)
 
     @staticmethod
     def _hash_file(path: Path, algorithm: str) -> str:
         digest = hashlib.new(algorithm)
-        with path.open("rb") as f:
-            while chunk := f.read(1024 * 1024):
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
         return digest.hexdigest()
 
@@ -317,25 +332,22 @@ class DownloadEngine:
         actual = await asyncio.to_thread(self._hash_file, path, algorithm)
         return actual.lower() == expected.lower()
 
-    def _update_speed(self, task: DownloadTask) -> None:
+    @staticmethod
+    def _update_speed(task: DownloadTask) -> float:
         instantaneous = task.speed_meter.update(task.downloaded)
         average = task.speed_meter.average(task.downloaded)
-        # The UI should never report 0 B/s while bytes are actively arriving.
-        # Average throughput is used as a stable fallback when concurrent worker
-        # scheduling makes a single instantaneous sample momentarily zero.
-        task.speed = max(instantaneous, average if task.downloaded > task.speed_baseline else 0.0)
-        task.peak_speed = max(task.peak_speed, task.speed_meter.peak, task.speed)
+        if task.downloaded > task.speed_meter.baseline_bytes:
+            return max(instantaneous, average)
+        return instantaneous
 
-    def pause(self, task_id: str):
+    def pause(self, task_id: str) -> None:
         self._pause.add(task_id)
 
-    def resume(self, task_id: str):
+    def resume(self, task_id: str) -> None:
         self._pause.discard(task_id)
 
-    def cancel(self, task_id: str):
+    def cancel(self, task_id: str) -> None:
         self._cancel.add(task_id)
 
-    def shutdown(self):
-        for t in self._tasks.values():
-            t.cancel()
-        self._tasks.clear()
+    def cleanup(self, task: DownloadTask) -> None:
+        shutil.rmtree(self._workspace(task), ignore_errors=True)
