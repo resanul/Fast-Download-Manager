@@ -115,15 +115,16 @@ class DownloadEngine:
         for attempt in range(self.retries):
             try:
                 headers = {"Range": f"bytes={existing}-"} if existing else {}
-                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
-                    async with client.stream("GET", task.url, headers=headers) as r:
-                        r.raise_for_status()
-                        if existing and r.status_code != 206:
-                            existing = 0
-                            temp.unlink(missing_ok=True)
-                            headers = {}
-                            continue
-                        await self._write_stream(task, r, temp, existing, progress)
+                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client, client.stream(
+                    "GET", task.url, headers=headers
+                ) as r:
+                    r.raise_for_status()
+                    if existing and r.status_code != 206:
+                        existing = 0
+                        temp.unlink(missing_ok=True)
+                        headers = {}
+                        continue
+                    await self._write_stream(task, r, temp, existing, progress)
                 if task.total is None:
                     task.total = temp.stat().st_size
                 if task.total is None or temp.stat().st_size == task.total:
