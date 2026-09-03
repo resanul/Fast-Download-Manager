@@ -41,7 +41,7 @@ class Worker(QObject):
             self.finished.emit(result)
         except asyncio.CancelledError:
             self.finished.emit(self.task)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
 
