@@ -36,8 +36,6 @@ def test_verify(tmp_path):
 
 def test_speed_reports_transferred_bytes():
     task = DownloadTask("1", "https://example.com/a", Path("a"))
-    task.speed_started = 100.0
-    task.speed_baseline = 0
     task.downloaded = 4 * 1024 * 1024
     task.speed_meter.reset(0)
     with patch("fastdm.engine.time.monotonic", return_value=102.0):
@@ -51,6 +49,8 @@ def test_speed_reports_transferred_bytes():
 def test_speed_meter_tracks_peak_rate():
     meter = SpeedMeter()
     meter.reset(0)
+    meter.baseline_time = 100.0
+    meter.last_time = 100.0
     with patch("fastdm.engine.time.monotonic", side_effect=[101.0, 103.0]):
         first = meter.update(8 * 1024 * 1024)
         second = meter.update(12 * 1024 * 1024)
