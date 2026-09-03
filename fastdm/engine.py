@@ -139,9 +139,7 @@ class DownloadEngine:
             else:
                 await self._single(task, progress)
             if task.checksum_algorithm and task.expected_checksum:
-                actual = await asyncio.to_thread(
-                    self._hash_file, task.destination, task.checksum_algorithm
-                )
+                actual = await asyncio.to_thread(self._hash_file, task.destination, task.checksum_algorithm)
                 task.actual_checksum = actual
                 if actual.lower() != task.expected_checksum.lower():
                     task.destination.unlink(missing_ok=True)
@@ -176,23 +174,28 @@ class DownloadEngine:
         for attempt in range(self.retries):
             try:
                 headers = {"Range": f"bytes={existing}-"} if existing else {}
-                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
-                    async with client.stream("GET", task.url, headers=headers) as response:
-                        response.raise_for_status()
-                        if existing and response.status_code != 206:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client, client.stream("GET", task.url, headers=headers) as response:
+                    response.raise_for_status()
+                    if existing and response.status_code != 206:
+                        existing = 0
+                        temp.unlink(missing_ok=True)
+                        task.downloaded = 0
+                        task.speed_meter.reset(0)
+                        continue
+                    if existing and response.status_code == 206:
+                        content_range = response.headers.get("content-range", "")
+                        if not content_range.startswith(f"bytes {existing}-"):
                             existing = 0
                             temp.unlink(missing_ok=True)
                             task.downloaded = 0
                             task.speed_meter.reset(0)
                             continue
-                        await self._write_stream(task, response, temp, existing, progress)
+                    await self._write_stream(task, response, temp, existing, progress)
 
                 if task.total is None:
                     task.total = temp.stat().st_size
                 if temp.stat().st_size != task.total:
-                    raise RuntimeError(
-                        f"Downloaded size mismatch: expected {task.total}, got {temp.stat().st_size}"
-                    )
+                    raise RuntimeError(f"Downloaded size mismatch: expected {task.total}, got {temp.stat().st_size}")
                 os.replace(temp, task.destination)
                 shutil.rmtree(workspace, ignore_errors=True)
                 return
@@ -232,20 +235,11 @@ class DownloadEngine:
         segment_size = total // connections
         workspace = self._workspace(task)
         workspace.mkdir(parents=True, exist_ok=True)
-        task.segments = [
-            Segment(
-                i * segment_size,
-                total - 1 if i == connections - 1 else (i + 1) * segment_size - 1,
-            )
-            for i in range(connections)
-        ]
+        task.segments = [Segment(i * segment_size, total - 1 if i == connections - 1 else (i + 1) * segment_size - 1) for i in range(connections)]
 
         for i, segment in enumerate(task.segments):
             part = workspace / f"segment-{i:04d}.part"
-            segment.downloaded = min(
-                part.stat().st_size if part.exists() else 0,
-                segment.end - segment.start + 1,
-            )
+            segment.downloaded = min(part.stat().st_size if part.exists() else 0, segment.end - segment.start + 1)
 
         task.downloaded = sum(segment.downloaded for segment in task.segments)
         task.speed_meter.reset(task.downloaded)
@@ -264,10 +258,10 @@ class DownloadEngine:
                     try:
                         headers = {"Range": f"bytes={start}-{segment.end}"}
                         async with client.stream("GET", task.url, headers=headers) as response:
-                            if response.status_code != 206:
-                                raise RuntimeError(
-                                    f"Server did not honor Range request (HTTP {response.status_code})"
-                                )
+                            content_range = response.headers.get("content-range", "")
+                            expected_prefix = f"bytes {start}-"
+                            if response.status_code != 206 or not content_range.startswith(expected_prefix):
+                                raise RuntimeError(f"Server did not honor Range request (HTTP {response.status_code})")
                             with part.open("ab" if have else "wb") as output:
                                 async for chunk in response.aiter_bytes(self.chunk_size):
                                     while task.id in self._pause:
@@ -299,10 +293,7 @@ class DownloadEngine:
                         if attempt == self.retries - 1:
                             raise
                         await asyncio.sleep(2**attempt)
-                        have = min(
-                            part.stat().st_size if part.exists() else 0,
-                            segment.end - segment.start + 1,
-                        )
+                        have = min(part.stat().st_size if part.exists() else 0, segment.end - segment.start + 1)
                         start = segment.start + have
 
         await asyncio.gather(*(worker(i, segment) for i, segment in enumerate(task.segments)))
