@@ -100,18 +100,17 @@ class DownloadEngine:
         temp = task.destination.with_suffix(task.destination.suffix + ".part")
         existing = temp.stat().st_size if temp.exists() else 0
         headers = {"Range": f"bytes={existing}-"} if existing else {}
-        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
-            async with client.stream("GET", task.url, headers=headers) as r:
-                r.raise_for_status()
-                if existing and r.status_code != 206:
-                    existing = 0
-                    temp.unlink(missing_ok=True)
-                    async with client.stream("GET", task.url) as rr:
-                        rr.raise_for_status()
-                        await self._write_stream(task, rr, temp, 0, progress)
-                    os.replace(temp, task.destination)
-                    return
-                await self._write_stream(task, r, temp, existing, progress)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client, client.stream("GET", task.url, headers=headers) as r:
+            r.raise_for_status()
+            if existing and r.status_code != 206:
+                existing = 0
+                temp.unlink(missing_ok=True)
+                async with client.stream("GET", task.url) as rr:
+                    rr.raise_for_status()
+                    await self._write_stream(task, rr, temp, 0, progress)
+                os.replace(temp, task.destination)
+                return
+            await self._write_stream(task, r, temp, existing, progress)
         os.replace(temp, task.destination)
 
     async def _write_stream(self, task, response, path, initial, progress):
