@@ -20,6 +20,46 @@ class Segment:
 
 
 @dataclass
+class SpeedMeter:
+    """Tracks instantaneous, average, and peak throughput from byte deltas."""
+
+    baseline_bytes: int = 0
+    baseline_time: float = field(default_factory=time.monotonic)
+    last_bytes: int = 0
+    last_time: float = field(default_factory=time.monotonic)
+    speed: float = 0.0
+    peak: float = 0.0
+
+    def reset(self, bytes_done: int = 0) -> None:
+        now = time.monotonic()
+        self.baseline_bytes = bytes_done
+        self.baseline_time = now
+        self.last_bytes = bytes_done
+        self.last_time = now
+        self.speed = 0.0
+        self.peak = 0.0
+
+    def update(self, bytes_done: int) -> float:
+        now = time.monotonic()
+        elapsed = now - self.last_time
+        delta = max(0, bytes_done - self.last_bytes)
+        if delta and elapsed > 0:
+            self.speed = delta / elapsed
+            self.peak = max(self.peak, self.speed)
+            self.last_bytes = bytes_done
+            self.last_time = now
+        elif elapsed > 0 and bytes_done < self.last_bytes:
+            self.last_bytes = bytes_done
+            self.last_time = now
+            self.speed = 0.0
+        return self.speed
+
+    def average(self, bytes_done: int) -> float:
+        elapsed = max(time.monotonic() - self.baseline_time, 0.001)
+        return max(0, bytes_done - self.baseline_bytes) / elapsed
+
+
+@dataclass
 class DownloadTask:
     id: str
     url: str
@@ -36,6 +76,8 @@ class DownloadTask:
     actual_checksum: str | None = None
     speed_started: float = 0.0
     speed_baseline: int = 0
+    speed_meter: SpeedMeter = field(default_factory=SpeedMeter, repr=False)
+    peak_speed: float = 0.0
 
 
 class DownloadEngine:
@@ -82,6 +124,8 @@ class DownloadEngine:
         task.speed = 0.0
         task.speed_started = time.monotonic()
         task.speed_baseline = task.downloaded
+        task.speed_meter.reset(task.downloaded)
+        task.peak_speed = 0.0
         try:
             meta = await self.analyze(task.url)
             task.url = meta["url"]
@@ -124,6 +168,7 @@ class DownloadEngine:
         task.downloaded = existing
         task.speed_baseline = existing
         task.speed_started = time.monotonic()
+        task.speed_meter.reset(existing)
         for attempt in range(self.retries):
             try:
                 headers = {"Range": f"bytes={existing}-"} if existing else {}
@@ -135,6 +180,7 @@ class DownloadEngine:
                         existing = 0
                         task.downloaded = 0
                         task.speed_baseline = 0
+                        task.speed_meter.reset(0)
                         temp.unlink(missing_ok=True)
                         continue
                     await self._write_stream(task, r, temp, existing, progress)
@@ -160,7 +206,7 @@ class DownloadEngine:
             async for chunk in response.aiter_bytes(self.chunk_size):
                 while task.id in self._pause:
                     task.status = "paused"
-                    task.speed = self._speed(task)
+                    task.speed = task.speed_meter.speed
                     if progress:
                         progress(task)
                     await asyncio.sleep(0.2)
@@ -171,7 +217,7 @@ class DownloadEngine:
                 f.flush()
                 done += len(chunk)
                 task.downloaded = done
-                task.speed = self._speed(task)
+                self._update_speed(task)
                 if progress:
                     progress(task)
 
@@ -185,15 +231,22 @@ class DownloadEngine:
             Segment(i * size, total - 1 if i == n - 1 else (i + 1) * size - 1)
             for i in range(n)
         ]
-        task.downloaded = 0
-        task.speed_baseline = 0
+        initial_total = 0
+        for i, seg in enumerate(task.segments):
+            part = tempdir / f"{i:04d}.part"
+            have = min(part.stat().st_size if part.exists() else 0, seg.end - seg.start + 1)
+            seg.downloaded = have
+            initial_total += have
+        task.downloaded = initial_total
+        task.speed_baseline = initial_total
         task.speed_started = time.monotonic()
+        task.speed_meter.reset(initial_total)
+        task.peak_speed = 0.0
         lock = asyncio.Lock()
 
         async def worker(i, seg):
             part = tempdir / f"{i:04d}.part"
-            have = min(part.stat().st_size if part.exists() else 0, seg.end - seg.start + 1)
-            seg.downloaded = have
+            have = seg.downloaded
             start = seg.start + have
             if start > seg.end:
                 seg.complete = True
@@ -209,7 +262,7 @@ class DownloadEngine:
                                 async for chunk in r.aiter_bytes(self.chunk_size):
                                     while task.id in self._pause:
                                         task.status = "paused"
-                                        task.speed = self._speed(task)
+                                        task.speed = task.speed_meter.speed
                                         if progress:
                                             progress(task)
                                         await asyncio.sleep(0.2)
@@ -222,7 +275,7 @@ class DownloadEngine:
                                     seg.downloaded = have
                                     async with lock:
                                         task.downloaded = sum(s.downloaded for s in task.segments)
-                                        task.speed = self._speed(task)
+                                        self._update_speed(task)
                                     if progress:
                                         progress(task)
                             if have != seg.end - seg.start + 1:
@@ -251,13 +304,6 @@ class DownloadEngine:
         tempdir.rmdir()
 
     @staticmethod
-    def _speed(task: DownloadTask) -> float:
-        started = task.speed_started or time.monotonic()
-        elapsed = max(time.monotonic() - started, 0.001)
-        transferred = max(0, task.downloaded - task.speed_baseline)
-        return transferred / elapsed
-
-    @staticmethod
     def _hash_file(path: Path, algorithm: str) -> str:
         digest = hashlib.new(algorithm)
         with path.open("rb") as f:
@@ -268,6 +314,10 @@ class DownloadEngine:
     async def verify(self, path: Path, algorithm: str, expected: str) -> bool:
         actual = await asyncio.to_thread(self._hash_file, path, algorithm)
         return actual.lower() == expected.lower()
+
+    def _update_speed(self, task: DownloadTask) -> None:
+        task.speed = task.speed_meter.update(task.downloaded)
+        task.peak_speed = task.speed_meter.peak
 
     def pause(self, task_id: str):
         self._pause.add(task_id)
