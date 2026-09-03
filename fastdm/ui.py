@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QDateTime, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QDateTime, QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -20,10 +21,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSpinBox,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -107,6 +111,9 @@ class MainWindow(QMainWindow):
         self.workers: dict[str, Worker] = {}
         self.threads: dict[str, QThread] = {}
         self.priorities: dict[str, Priority] = {}
+        self._force_exit = False
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        self._minimize_to_tray = self.db.get_setting("minimize_to_tray", "1") == "1"
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -171,6 +178,7 @@ class MainWindow(QMainWindow):
             "QHeaderView::section{background:#222733;color:#bbb;padding:8px}"
         )
 
+        self._setup_tray()
         self.load_history()
         self.load_schedules()
         self._schedule_timer = QTimer(self)
@@ -186,6 +194,71 @@ class MainWindow(QMainWindow):
         if sys.platform != "win32":
             base = Path.home() / ".local" / "share" / "fast-download-manager"
         return base / "downloads.db"
+
+    def _setup_tray(self):
+        if not self._tray_available:
+            self.tray = None
+            return
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.tray.setToolTip("Fast Download Manager")
+        menu = QMenu()
+        show_action = menu.addAction("Show Fast Download Manager")
+        show_action.triggered.connect(self._restore_from_tray)
+        menu.addSeparator()
+        pause_all = menu.addAction("Pause All")
+        pause_all.triggered.connect(self.pause_all)
+        resume_all = menu.addAction("Resume All")
+        resume_all.triggered.connect(self.resume_all)
+        menu.addSeparator()
+        self.minimize_action = menu.addAction("Minimize to Tray")
+        self.minimize_action.setCheckable(True)
+        self.minimize_action.setChecked(self._minimize_to_tray)
+        self.minimize_action.toggled.connect(self.set_minimize_to_tray)
+        menu.addSeparator()
+        exit_action = menu.addAction("Exit")
+        exit_action.triggered.connect(self.exit_application)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+    def _tray_activated(self, reason):
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def set_minimize_to_tray(self, enabled: bool):
+        self._minimize_to_tray = enabled
+        self.db.set_setting("minimize_to_tray", "1" if enabled else "0")
+
+    def exit_application(self):
+        self._force_exit = True
+        self.close()
+
+    def pause_all(self):
+        for task in self.tasks.values():
+            if task.status in {"downloading", "queued"}:
+                self.engine.pause(task.id)
+                task.status = "paused"
+                self.queue.remove(task.id)
+                self.progress(task)
+        self._update_queue_status()
+
+    def resume_all(self):
+        for task in self.tasks.values():
+            if task.status == "paused":
+                self.engine.resume(task.id)
+                task.status = "queued"
+                self.queue.enqueue(task.id, self.priorities.get(task.id, Priority.NORMAL))
+                self.progress(task)
+        self._pump_queue()
 
     def load_history(self):
         for item in self.db.list():
@@ -208,6 +281,18 @@ class MainWindow(QMainWindow):
                 self.priorities[task.id] = priority
                 self.queue.enqueue(task.id, priority)
                 status = "queued"
+            elif status == "scheduled":
+                task = DownloadTask(
+                    item["id"],
+                    item["url"],
+                    Path(item["destination"]),
+                    total=item["total"],
+                    downloaded=item["downloaded"] or 0,
+                    status="scheduled",
+                    created=item["created"],
+                )
+                self.tasks[task.id] = task
+                self.priorities[task.id] = priority
             row = self._insert_row(
                 item["id"],
                 item["filename"],
@@ -266,6 +351,7 @@ class MainWindow(QMainWindow):
         task.status = "scheduled"
         self.progress(task)
         self.status.setText("Download scheduled")
+        self._notify("Download scheduled", f"{task.destination.name} has been scheduled.")
 
     def _process_schedules(self):
         now = datetime.now(UTC).timestamp()
@@ -279,6 +365,7 @@ class MainWindow(QMainWindow):
             self.queue.enqueue(task.id, self.priorities.get(task.id, Priority.NORMAL))
             task.status = "queued"
             self.progress(task)
+            self._notify("Scheduled download started", task.destination.name)
             if schedule.interval:
                 schedule.advance(now)
                 self.db.upsert_schedule(
@@ -396,6 +483,8 @@ class MainWindow(QMainWindow):
         self.queue.mark_finished(task.id)
         self.progress(task)
         self.status.setText(f"Download {task.status}")
+        if task.status == "completed":
+            self._notify("Download complete", task.destination.name)
         self._pump_queue()
 
     def fail(self, task_id: str, error: str):
@@ -406,8 +495,13 @@ class MainWindow(QMainWindow):
             task.error = error
             self._save(task)
             self.progress(task)
+            self._notify("Download failed", f"{task.destination.name}: {error}")
         self.status.setText("Download failed: " + error)
         self._pump_queue()
+
+    def _notify(self, title: str, message: str):
+        if self.tray and QSystemTrayIcon.supportsMessages():
+            self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 5000)
 
     def _selected_task(self):
         selected = self.table.selectionModel().selectedRows()
@@ -424,6 +518,7 @@ class MainWindow(QMainWindow):
         if task:
             self.engine.pause(task.id)
             task.status = "paused"
+            self.queue.remove(task.id)
             self.progress(task)
 
     def resume_selected(self):
@@ -431,13 +526,16 @@ class MainWindow(QMainWindow):
         if task:
             self.engine.resume(task.id)
             if task.status == "paused":
-                task.status = "downloading"
+                task.status = "queued"
+                self.queue.enqueue(task.id, self.priorities.get(task.id, Priority.NORMAL))
             self.progress(task)
+            self._pump_queue()
 
     def cancel_selected(self):
         task = self._selected_task()
         if task:
             self.engine.cancel(task.id)
+            self.queue.remove(task.id)
             task.status = "cancelled"
             self.progress(task)
 
@@ -455,8 +553,8 @@ class MainWindow(QMainWindow):
         task = self._selected_task()
         if not task:
             return
-        import os
-        os.startfile(task.destination.parent) if sys.platform == "win32" else None
+        if sys.platform == "win32":
+            os.startfile(task.destination.parent)
 
     def _update_queue_status(self):
         self.status.setText(
@@ -494,15 +592,26 @@ class MainWindow(QMainWindow):
         return f"{n:.1f} PB"
 
     def closeEvent(self, event):
+        if self._minimize_to_tray and self.tray and not self._force_exit:
+            self.hide()
+            self._notify("Fast Download Manager", "Still running in the system tray.")
+            event.ignore()
+            return
         self._schedule_timer.stop()
+        if self.tray:
+            self.tray.hide()
         self.scheduler.close()
         self.engine.shutdown()
+        for thread in list(self.threads.values()):
+            thread.quit()
+            thread.wait(3000)
         self.db.close()
         event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     window = MainWindow()
     window.show()
     return app.exec()
