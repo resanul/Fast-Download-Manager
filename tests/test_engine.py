@@ -57,3 +57,11 @@ def test_speed_meter_tracks_peak_rate():
     assert first == 8 * 1024 * 1024
     assert second == 2 * 1024 * 1024
     assert meter.peak == first
+
+
+def test_workspaces_are_unique_for_same_filename(tmp_path):
+    first = DownloadTask("one", "https://example.com/file.zip", tmp_path / "file.zip")
+    second = DownloadTask("two", "https://example.com/file.zip", tmp_path / "file.zip")
+    assert DownloadEngine._workspace(first) != DownloadEngine._workspace(second)
+    assert DownloadEngine._workspace(first).name == "one"
+    assert DownloadEngine._workspace(second).name == "two"
