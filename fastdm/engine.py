@@ -43,14 +43,19 @@ class SpeedMeter:
         now = time.monotonic()
         elapsed = now - self.last_time
         delta = max(0, bytes_done - self.last_bytes)
-        if delta and elapsed > 0:
-            self.speed = delta / elapsed
+        if delta > 0:
+            # Clamp the sample interval so a worker thread waking after a long
+            # scheduling gap does not turn a healthy transfer into ~0 B/s.
+            sample_elapsed = min(max(elapsed, 0.001), 2.0)
+            self.speed = delta / sample_elapsed
             self.peak = max(self.peak, self.speed)
             self.last_bytes = bytes_done
             self.last_time = now
-        elif elapsed > 0 and bytes_done < self.last_bytes:
+        elif bytes_done < self.last_bytes:
             self.last_bytes = bytes_done
             self.last_time = now
+            self.speed = 0.0
+        elif elapsed >= 2.0:
             self.speed = 0.0
         return self.speed
 
@@ -83,7 +88,7 @@ class DownloadTask:
 class DownloadEngine:
     """Async HTTP downloader with range-aware segmented downloads and recovery."""
 
-    def __init__(self, connections: int = 8, chunk_size: int = 1024 * 1024, retries: int = 5):
+    def __init__(self, connections: int = 8, chunk_size: int = 256 * 1024, retries: int = 5):
         self.connections = max(1, min(connections, 32))
         self.chunk_size = max(64 * 1024, chunk_size)
         self.retries = max(1, min(retries, 10))
@@ -167,7 +172,6 @@ class DownloadEngine:
         existing = temp.stat().st_size if temp.exists() else 0
         task.downloaded = existing
         task.speed_baseline = existing
-        task.speed_started = time.monotonic()
         task.speed_meter.reset(existing)
         for attempt in range(self.retries):
             try:
