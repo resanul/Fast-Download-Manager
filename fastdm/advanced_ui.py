@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import uuid
+from pathlib import Path
 
 from .download_dialogs import DownloadFileInfoDialog, DownloadStatusDialog
 from .engine import DownloadTask
