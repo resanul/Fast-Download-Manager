@@ -4,7 +4,7 @@ from PySide6.QtCore import QTimer
 
 
 def install(main_window_cls) -> None:
-    """Keep dashboard speed synchronized with the same task telemetry used by rows."""
+    """Keep dashboard and row speed displays synchronized with live task telemetry."""
 
     original_init = main_window_cls.__init__
 
@@ -17,11 +17,13 @@ def install(main_window_cls) -> None:
         self._refresh_live_speed()
 
     def _refresh_live_speed(self):
-        active_speed = sum(
-            max(0.0, float(task.speed))
-            for task in self.tasks.values()
-            if task.status == "downloading"
-        )
+        active_speed = 0.0
+        for task in self.tasks.values():
+            if task.status == "downloading":
+                task.speed = task.speed_meter.update(task.downloaded)
+                task.peak_speed = max(task.peak_speed, task.speed)
+                active_speed += max(0.0, float(task.speed))
+
         self.stat_speed.set_value(self._format_rate(active_speed))
 
         for task_id, row in self.rows.items():
@@ -30,7 +32,8 @@ def install(main_window_cls) -> None:
                 continue
             speed_item = self.table.item(row, 4)
             if speed_item:
-                speed_item.setText(self._format_rate(task.speed if task.status == "downloading" else 0.0))
+                value = task.speed if task.status == "downloading" else 0.0
+                speed_item.setText(self._format_rate(value))
 
     main_window_cls.__init__ = _init
     main_window_cls._refresh_live_speed = _refresh_live_speed
