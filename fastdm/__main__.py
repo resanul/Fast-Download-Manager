@@ -1,5 +1,5 @@
-from fastdm.ui import MainWindow, main
 from fastdm.advanced_ui import install
+from fastdm.ui import MainWindow, main
 
 install(MainWindow)
 
