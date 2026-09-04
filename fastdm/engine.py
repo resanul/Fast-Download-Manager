@@ -43,9 +43,7 @@ class SpeedMeter:
 
     def update(self, bytes_done: int) -> float:
         now = time.monotonic()
-        if not self.samples:
-            self.samples.append((now, bytes_done))
-        elif bytes_done > self.samples[-1][1]:
+        if not self.samples or bytes_done > self.samples[-1][1]:
             self.samples.append((now, bytes_done))
 
         cutoff = now - self.window_seconds
@@ -133,13 +131,13 @@ class DownloadEngine:
         self._pause.discard(task.id)
         task.status = "analyzing"
         task.error = None
+        task.speed_meter.reset(task.downloaded)
         try:
             metadata = await self.analyze(task.url)
             task.url = metadata["url"]
             task.total = metadata["size"]
             task.status = "downloading"
             task.destination.parent.mkdir(parents=True, exist_ok=True)
-            task.speed_meter.reset(task.downloaded)
             if task.total and metadata["range"] and task.total >= 4 * 1024 * 1024:
                 await self._segmented(task, progress)
             else:
@@ -231,7 +229,7 @@ class DownloadEngine:
                 output.flush()
                 task.downloaded = output.tell() if not initial else initial + output.tell()
                 task.speed = self._update_speed(task)
-                task.peak_speed = max(task.peak_speed, task.speed_meter.peak)
+                task.peak_speed = max(task.peak_speed, task.speed)
                 if progress:
                     progress(task)
 
@@ -286,7 +284,7 @@ class DownloadEngine:
                                     async with lock:
                                         task.downloaded = sum(s.downloaded for s in task.segments)
                                         task.speed = self._update_speed(task)
-                                        task.peak_speed = max(task.peak_speed, task.speed_meter.peak)
+                                        task.peak_speed = max(task.peak_speed, task.speed)
                                     if progress:
                                         progress(task)
                             if have != segment.end - segment.start + 1:
@@ -331,13 +329,11 @@ class DownloadEngine:
 
     @staticmethod
     def _update_speed(task: DownloadTask) -> float:
-        rolling = task.speed_meter.update(task.downloaded)
+        instantaneous = task.speed_meter.update(task.downloaded)
         average = task.speed_meter.average(task.downloaded)
-        if rolling > 0:
-            return rolling
-        if average > 0 and task.downloaded > task.speed_meter.baseline_bytes:
-            return average
-        return 0.0
+        if task.downloaded > task.speed_meter.baseline_bytes:
+            return max(instantaneous, average)
+        return instantaneous
 
     def pause(self, task_id: str) -> None:
         self._pause.add(task_id)
