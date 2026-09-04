@@ -1,8 +1,10 @@
 from fastdm.advanced_ui import install
 from fastdm.single_instance import SingleInstance
+from fastdm.telemetry import install as install_telemetry
 from fastdm.ui import MainWindow, main
 
 install(MainWindow)
+install_telemetry(MainWindow)
 
 
 if __name__ == "__main__":
