@@ -21,6 +21,8 @@ DefaultDirName={localappdata}\Programs\Fast Download Manager
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 DisableDirPage=yes
+UsePreviousAppDir=yes
+UsePreviousTasks=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -32,6 +34,7 @@ WizardStyle=modern
 CloseApplications=yes
 CloseApplicationsFilter={#MyAppExeName}
 RestartApplications=no
+Uninstallable=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 AppMutex=Local\FastDownloadManager.Singleton
 LicenseFile=..\LICENSE
@@ -56,5 +59,4 @@ Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: st
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{localappdata}\FastDownloadManager"
 Type: filesandordirs; Name: "{app}\.fastdm"
