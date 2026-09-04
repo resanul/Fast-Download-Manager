@@ -65,6 +65,24 @@ jobs:
           Write-Host "Version verified: $projectVersion"
       - name: Build application EXE
         run: pyinstaller --noconfirm --clean --onefile --windowed --name Fast-Download-Manager fastdm/__main__.py
+      - name: Windows EXE startup smoke test
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'dist\Fast-Download-Manager.exe'
+          $process = Start-Process -FilePath $exe -PassThru
+          try {
+            Start-Sleep -Seconds 5
+            if ($process.HasExited) {
+              throw "EXE exited during startup with code $($process.ExitCode)"
+            }
+            Write-Host "Startup smoke test passed (PID $($process.Id))"
+          }
+          finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+              Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+            }
+          }
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
@@ -73,7 +91,7 @@ jobs:
         run: |
           $version = $env:APP_VERSION.TrimStart('v')
           & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DMyAppVersion=$version" 'installer\FastDownloadManager.iss'
-      - name: Verify package
+      - name: Verify installer artifacts
         shell: pwsh
         run: |
           $exe = 'dist\Fast-Download-Manager.exe'
@@ -84,6 +102,18 @@ jobs:
             if ($size -lt 1000000) { throw "Package unexpectedly small: $path ($size bytes)" }
             Write-Host "Verified $path ($size bytes)"
           }
+      - name: Test installer install and same-version upgrade path
+        shell: pwsh
+        run: |
+          $installer = Resolve-Path 'dist\installer\Fast-Download-Manager-Setup.exe'
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Fast Download Manager'
+          $args = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /DIR=`"$installDir`""
+          $first = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
+          if ($first.ExitCode -ne 0) { throw "Initial installer failed with code $($first.ExitCode)" }
+          if (-not (Test-Path (Join-Path $installDir 'Fast-Download-Manager.exe'))) { throw 'Installed EXE missing after initial install' }
+          $second = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
+          if ($second.ExitCode -ne 0) { throw "Second installer run failed with code $($second.ExitCode)" }
+          if (-not (Test-Path (Join-Path $installDir 'Fast-Download-Manager.exe'))) { throw 'Installed EXE missing after upgrade run' }
       - name: Generate checksums
         shell: pwsh
         run: |
