@@ -1,5 +1,6 @@
-from fastdm.engine import DownloadTask, SpeedMeter
 from pathlib import Path
+
+from fastdm.engine import DownloadTask, SpeedMeter
 
 
 def test_speed_meter_uses_rolling_window():
