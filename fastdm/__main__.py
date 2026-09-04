@@ -1,5 +1,3 @@
-import sys
-
 from fastdm.advanced_ui import install
 from fastdm.single_instance import SingleInstance
 from fastdm.ui import MainWindow, main
