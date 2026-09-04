@@ -9,43 +9,103 @@ on:
 permissions:
   contents: write
 
-jobs:
-  release:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+jobs:
+  validate:
+    name: Validate release candidate
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest
+
+  package:
+    name: Build Windows installer
+    needs: validate
+    runs-on: windows-latest
+    env:
+      APP_VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
           pip install -e .
-
-      - name: Lint
-        run: ruff check .
-
-      - name: Test
-        run: pytest
-
-      - name: Build Windows EXE
+      - name: Build application EXE
         run: pyinstaller --noconfirm --clean --onefile --windowed --name Fast-Download-Manager fastdm/__main__.py
-
-      - name: Generate SHA-256
-        shell: powershell
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: pwsh
         run: |
-          $hash = (Get-FileHash dist/Fast-Download-Manager.exe -Algorithm SHA256).Hash
-          "$hash  Fast-Download-Manager.exe" | Out-File -FilePath SHA256SUMS.txt -Encoding ascii
+          $version = $env:APP_VERSION.TrimStart('v')
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DMyAppVersion=$version" 'installer\FastDownloadManager.iss'
+      - name: Verify package
+        shell: pwsh
+        run: |
+          $exe = 'dist\Fast-Download-Manager.exe'
+          $installer = 'dist\installer\Fast-Download-Manager-Setup.exe'
+          foreach ($path in @($exe, $installer)) {
+            if (-not (Test-Path $path)) { throw "Missing package: $path" }
+            $size = (Get-Item $path).Length
+            if ($size -lt 1000000) { throw "Package unexpectedly small: $path ($size bytes)" }
+            Write-Host "Verified $path ($size bytes)"
+          }
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $exeHash = (Get-FileHash 'dist\Fast-Download-Manager.exe' -Algorithm SHA256).Hash
+          $installerHash = (Get-FileHash 'dist\installer\Fast-Download-Manager-Setup.exe' -Algorithm SHA256).Hash
+          @(
+            "$exeHash  Fast-Download-Manager.exe"
+            "$installerHash  Fast-Download-Manager-Setup.exe"
+          ) | Out-File 'SHA256SUMS.txt' -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fast-Download-Manager-release
+          path: |
+            dist/Fast-Download-Manager.exe
+            dist/installer/Fast-Download-Manager-Setup.exe
+            SHA256SUMS.txt
 
-      - name: Publish GitHub Release
+  publish:
+    name: Publish GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Fast-Download-Manager-release
+          path: release
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
-            dist/Fast-Download-Manager.exe
-            SHA256SUMS.txt
+            release/Fast-Download-Manager.exe
+            release/Fast-Download-Manager-Setup.exe
+            release/SHA256SUMS.txt
