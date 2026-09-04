@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-
-from PySide6.QtWidgets import QTableWidget
+import uuid
 
 from .download_dialogs import DownloadFileInfoDialog, DownloadStatusDialog
 from .engine import DownloadTask
@@ -10,9 +9,8 @@ from .queue import Priority
 
 
 def install(main_window_cls):
-    """Install the richer IDM-style interaction layer without replacing the core engine."""
+    """Install IDM-style download information and live status interactions."""
     original_init = main_window_cls.__init__
-    original_add_download = main_window_cls.add_download
     original_progress = main_window_cls.progress
 
     def _init(self, *args, **kwargs):
@@ -22,11 +20,7 @@ def install(main_window_cls):
         self.table.cellDoubleClicked.connect(lambda row, column: self._show_status_for_row(row))
 
     def _show_status_for_row(self, row: int):
-        task_id = None
-        for candidate_id, candidate_row in self.rows.items():
-            if candidate_row == row:
-                task_id = candidate_id
-                break
+        task_id = next((candidate_id for candidate_id, candidate_row in self.rows.items() if candidate_row == row), None)
         if not task_id:
             return
         task = self.tasks.get(task_id)
@@ -67,18 +61,23 @@ def install(main_window_cls):
         downloads = Path.home() / "Downloads"
         default_folder = downloads if downloads.exists() else Path.home()
         dialog = DownloadFileInfoDialog(url="", filename="download", default_folder=default_folder, parent=self)
-        dialog.url_edit.setPlaceholderText("https://example.com/file.iso")
+
+        def refresh_default_path(url):
+            if not dialog.save_as.text() or dialog.save_as.text().endswith("download"):
+                filename = Path(url.split("?", 1)[0]).name or "download"
+                dialog.save_as.setText(str(default_folder / filename))
+
+        dialog.url_edit.textChanged.connect(refresh_default_path)
 
         def handle(payload):
             url = payload["url"]
             if not url:
                 self.status.setText("Enter a download URL")
                 return
-            filename = Path(url.split("?", 1)[0]).name or "download"
-            requested = Path(payload["save_as"]) if payload["save_as"] else default_folder / filename
-            folder = requested.parent
-            destination = self._unique_destination(folder, requested.name)
-            task = DownloadTask(task_id=__import__("uuid").uuid4().hex, url=url, destination=destination)
+            parsed_name = Path(url.split("?", 1)[0]).name or "download"
+            requested = Path(payload["save_as"]) if payload["save_as"] else default_folder / parsed_name
+            destination = self._unique_destination(requested.parent, requested.name)
+            task = DownloadTask(id=uuid.uuid4().hex, url=url, destination=destination)
             priority = Priority.NORMAL
             self.tasks[task.id] = task
             self.priorities[task.id] = priority
@@ -105,5 +104,4 @@ def install(main_window_cls):
     main_window_cls.progress = _progress
     main_window_cls._show_status_for_row = _show_status_for_row
     main_window_cls._refresh_status_dialog = _refresh_status_dialog
-
     return main_window_cls
