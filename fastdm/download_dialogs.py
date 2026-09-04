@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QSlider,
-    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -34,12 +33,10 @@ class DownloadFileInfoDialog(QDialog):
         self.setWindowTitle("Download File Info")
         self.resize(720, 430)
         self.setModal(True)
-
         root = QVBoxLayout(self)
         form = QFormLayout()
 
         self.url_edit = QLineEdit(url)
-        self.url_edit.setReadOnly(False)
         form.addRow("URL", self.url_edit)
 
         category_row = QHBoxLayout()
@@ -63,30 +60,25 @@ class DownloadFileInfoDialog(QDialog):
 
         self.remember = QCheckBox("Remember this path for selected category")
         form.addRow("", self.remember)
-
         self.description = QLineEdit()
         form.addRow("Description", self.description)
         root.addLayout(form)
 
-        self.details = QLabel("Preparing download metadata…")
+        self.details = QLabel("Metadata will be available after URL analysis.")
         self.details.setObjectName("downloadInfoDetails")
         root.addWidget(self.details)
 
         buttons = QDialogButtonBox(parent=self)
-        self.later = buttons.addButton("Download Later", QDialogButtonBox.ButtonRole.ActionRole)
-        self.start = buttons.addButton("Start Download", QDialogButtonBox.ButtonRole.AcceptRole)
-        self.cancel = buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
-        self.later.clicked.connect(self._download_later)
-        self.start.clicked.connect(self._start)
-        self.cancel.clicked.connect(self.reject)
+        later = buttons.addButton("Download Later", QDialogButtonBox.ButtonRole.ActionRole)
+        start = buttons.addButton("Start Download", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel = buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        later.clicked.connect(lambda: self._emit(True, True))
+        start.clicked.connect(lambda: self._emit(True, False))
+        cancel.clicked.connect(self.reject)
         root.addWidget(buttons)
 
     def set_metadata(self, *, size_text: str | None = None, mime: str | None = None, resumable: bool | None = None):
-        parts = []
-        if size_text:
-            parts.append(size_text)
-        if mime:
-            parts.append(mime)
+        parts = [value for value in (size_text, mime) if value]
         if resumable is not None:
             parts.append("Resume supported" if resumable else "Resume unknown")
         self.details.setText("  •  ".join(parts) if parts else "Metadata unavailable")
@@ -99,27 +91,23 @@ class DownloadFileInfoDialog(QDialog):
         if selected:
             self.save_as.setText(selected)
 
-    def _payload(self, later: bool):
-        return {
-            "url": self.url_edit.text().strip(),
-            "category": self.category.currentText(),
-            "save_as": self.save_as.text().strip(),
-            "remember": self.remember.isChecked(),
-            "description": self.description.text().strip(),
-            "later": later,
-        }
-
-    def _start(self):
-        self.start_download.emit(self._payload(False))
-        self.accept()
-
-    def _download_later(self):
-        self.start_download.emit(self._payload(True))
+    def _emit(self, start: bool, later: bool):
+        self.start_download.emit(
+            {
+                "url": self.url_edit.text().strip(),
+                "category": self.category.currentText(),
+                "save_as": self.save_as.text().strip(),
+                "remember": self.remember.isChecked(),
+                "description": self.description.text().strip(),
+                "later": later,
+                "start": start,
+            }
+        )
         self.accept()
 
 
 class DownloadStatusDialog(QDialog):
-    """IDM-style live download details with speed limiter and completion options."""
+    """Live IDM-style status dialog with speed limiter and completion options."""
 
     pause_requested = Signal()
     cancel_requested = Signal()
@@ -131,32 +119,26 @@ class DownloadStatusDialog(QDialog):
         self.setWindowTitle(filename)
         self.resize(760, 560)
         root = QVBoxLayout(self)
-
         tabs = QTabWidget()
+
         status = QWidget()
         status_layout = QVBoxLayout(status)
-
         info_group = QGroupBox("Download status")
         info = QFormLayout(info_group)
         self.url_label = QLabel(url)
+        self.url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.status_label = QLabel("Receiving data…")
         self.size_label = QLabel(self._fmt(total))
         self.downloaded_label = QLabel("0 B (0.00%)")
         self.rate_label = QLabel("0 B/s")
         self.time_left_label = QLabel("—")
         self.resume_label = QLabel("Yes")
-        info.addRow("URL", self.url_label)
-        info.addRow("Status", self.status_label)
-        info.addRow("File size", self.size_label)
-        info.addRow("Downloaded", self.downloaded_label)
-        info.addRow("Transfer rate", self.rate_label)
-        info.addRow("Time left", self.time_left_label)
-        info.addRow("Resume capability", self.resume_label)
+        for label, value in (("URL", self.url_label), ("Status", self.status_label), ("File size", self.size_label), ("Downloaded", self.downloaded_label), ("Transfer rate", self.rate_label), ("Time left", self.time_left_label), ("Resume capability", self.resume_label)):
+            info.addRow(label, value)
         status_layout.addWidget(info_group)
 
         self.progress = QSlider(Qt.Orientation.Horizontal)
         self.progress.setRange(0, 100)
-        self.progress.setValue(0)
         self.progress.setEnabled(False)
         status_layout.addWidget(self.progress)
 
@@ -164,6 +146,8 @@ class DownloadStatusDialog(QDialog):
         self.hide_details = QPushButton("<< Hide details")
         self.pause = QPushButton("Pause")
         self.cancel = QPushButton("Cancel")
+        details = QListWidget()
+        self.segment_list = details
         self.hide_details.clicked.connect(lambda: details.setVisible(not details.isVisible()))
         self.pause.clicked.connect(self.pause_requested.emit)
         self.cancel.clicked.connect(self.cancel_requested.emit)
@@ -172,10 +156,6 @@ class DownloadStatusDialog(QDialog):
         actions.addWidget(self.pause)
         actions.addWidget(self.cancel)
         status_layout.addLayout(actions)
-
-        details = QListWidget()
-        details.setObjectName("segmentList")
-        self.segment_list = details
         status_layout.addWidget(details, 1)
         tabs.addTab(status, "Download status")
 
@@ -186,6 +166,7 @@ class DownloadStatusDialog(QDialog):
         self.limit_slider.setRange(0, 1024)
         self.limit_slider.setValue(0)
         self.limit_value = QLabel("Unlimited")
+        self.limit_enabled.toggled.connect(lambda: self._limit_changed(self.limit_slider.value()))
         self.limit_slider.valueChanged.connect(self._limit_changed)
         limiter_layout.addRow("Enabled", self.limit_enabled)
         limiter_layout.addRow("Speed", self.limit_slider)
@@ -195,18 +176,17 @@ class DownloadStatusDialog(QDialog):
         completion = QWidget()
         completion_layout = QVBoxLayout(completion)
         self.close_after = QCheckBox("Close this window when download completes")
-        self.shutdown_after = QCheckBox("Shut down PC after completion")
         self.open_folder_after = QCheckBox("Open download folder after completion")
+        self.shutdown_after = QCheckBox("Shut down PC after completion")
         for widget in (self.close_after, self.open_folder_after, self.shutdown_after):
             widget.toggled.connect(self._completion_changed)
             completion_layout.addWidget(widget)
         completion_layout.addStretch(1)
         tabs.addTab(completion, "Options on completion")
-
         root.addWidget(tabs)
         self._total = total
         self._timer = QTimer(self)
-        self._timer.start(1000)
+        self._timer.setInterval(1000)
 
     @staticmethod
     def _fmt(value):
@@ -236,8 +216,7 @@ class DownloadStatusDialog(QDialog):
         if segments is not None:
             self.segment_list.clear()
             for index, seg in enumerate(segments, 1):
-                item = QListWidgetItem(f"{index:02d}    {self._fmt(seg.downloaded)}    Receiving data…")
-                self.segment_list.addItem(item)
+                self.segment_list.addItem(QListWidgetItem(f"{index:02d}    {self._fmt(seg.downloaded)}    Receiving data…"))
 
     def _limit_changed(self, value: int):
         enabled = self.limit_enabled.isChecked()
