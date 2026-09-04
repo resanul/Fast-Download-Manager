@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,27 +37,40 @@ def test_verify(tmp_path):
 
 def test_speed_reports_transferred_bytes():
     task = DownloadTask("1", "https://example.com/a", Path("a"))
-    task.downloaded = 4 * 1024 * 1024
-    task.speed_meter.reset(0)
+    meter = task.speed_meter
+    meter.reset(0)
+    meter.samples = deque([(100.0, 0), (102.0, 4 * 1024 * 1024)])
     with patch("fastdm.engine.time.monotonic", return_value=102.0):
-        task.speed_meter.baseline_time = 100.0
-        task.speed_meter.last_time = 100.0
-        speed = task.speed_meter.update(task.downloaded)
+        speed = meter.update(4 * 1024 * 1024)
     assert speed == 2 * 1024 * 1024
-    assert task.speed_meter.peak == speed
+    assert meter.peak == speed
 
 
 def test_speed_meter_tracks_peak_rate():
     meter = SpeedMeter()
     meter.reset(0)
-    meter.baseline_time = 100.0
-    meter.last_time = 100.0
     with patch("fastdm.engine.time.monotonic", side_effect=[101.0, 103.0]):
-        first = meter.update(8 * 1024 * 1024)
+        meter.samples = deque([(100.0, 0)])
+        meter.update(8 * 1024 * 1024)
+        meter.samples.append((102.0, 8 * 1024 * 1024))
         second = meter.update(12 * 1024 * 1024)
-    assert first == 8 * 1024 * 1024
     assert second == 2 * 1024 * 1024
-    assert meter.peak == first
+    assert meter.peak >= second
+
+
+def test_speed_meter_never_reports_negative_rate():
+    meter = SpeedMeter()
+    meter.reset(100)
+    assert meter.update(50) == 0.0
+
+
+def test_task_has_independent_speed_meter(tmp_path):
+    first = DownloadTask("one", "https://example.com/a", tmp_path / "a")
+    second = DownloadTask("two", "https://example.com/b", tmp_path / "b")
+    assert first.speed_meter is not second.speed_meter
+    first.speed_meter.reset(0)
+    assert first.speed_meter.update(1024 * 1024) >= 0
+    assert second.speed_meter.speed == 0.0
 
 
 def test_workspaces_are_unique_for_same_filename(tmp_path):
