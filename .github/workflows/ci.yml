@@ -64,7 +64,42 @@ jobs:
           $size = (Get-Item $exe).Length
           if ($size -lt 1000000) { throw "EXE unexpectedly small: $size bytes" }
           Write-Host "Verified: $exe ($size bytes)"
+      - name: Windows EXE startup smoke test
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'dist\Fast-Download-Manager.exe'
+          $process = Start-Process -FilePath $exe -PassThru
+          try {
+            Start-Sleep -Seconds 5
+            if ($process.HasExited) {
+              throw "EXE exited during startup with code $($process.ExitCode)"
+            }
+            Write-Host "Startup smoke test passed (PID $($process.Id))"
+          }
+          finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+              Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+            }
+          }
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build installer smoke package
+        shell: pwsh
+        run: |
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' '/DMyAppVersion=0.2.0' 'installer\FastDownloadManager.iss'
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          $installer = 'dist\installer\Fast-Download-Manager-Setup.exe'
+          if (-not (Test-Path $installer)) { throw 'Installer was not generated' }
+          $size = (Get-Item $installer).Length
+          if ($size -lt 1000000) { throw "Installer unexpectedly small: $size bytes" }
+          Write-Host "Verified: $installer ($size bytes)"
       - uses: actions/upload-artifact@v4
         with:
           name: Fast-Download-Manager-windows-ci
-          path: dist/Fast-Download-Manager.exe
+          path: |
+            dist/Fast-Download-Manager.exe
+            dist/installer/Fast-Download-Manager-Setup.exe
