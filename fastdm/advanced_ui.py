@@ -14,9 +14,14 @@ def install(main_window_cls):
     original_progress = main_window_cls.progress
 
     def _init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
+        # MainWindow.__init__ restores persisted history before returning.
+        # Seed the extension state first so the wrapped progress callback is
+        # safe when load_history() invokes it during startup.
         self._status_dialogs = {}
         self._advanced_metadata = {}
+        original_init(self, *args, **kwargs)
+        self._status_dialogs = getattr(self, "_status_dialogs", {})
+        self._advanced_metadata = getattr(self, "_advanced_metadata", {})
         self.table.cellDoubleClicked.connect(lambda row, column: self._show_status_for_row(row))
 
     def _show_status_for_row(self, row: int):
