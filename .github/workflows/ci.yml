@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on Ubuntu
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+      - name: Lint
+        run: ruff check .
+      - name: Unit and UI tests
+        run: pytest
+
+  windows-build:
+    name: Windows packaging smoke test
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pip install -e .
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name Fast-Download-Manager fastdm/__main__.py
+      - name: Verify EXE
+        shell: pwsh
+        run: |
+          $exe = 'dist\Fast-Download-Manager.exe'
+          if (-not (Test-Path $exe)) { throw 'EXE was not generated' }
+          $size = (Get-Item $exe).Length
+          if ($size -lt 1000000) { throw "EXE unexpectedly small: $size bytes" }
+          Write-Host "Verified: $exe ($size bytes)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fast-Download-Manager-windows-ci
+          path: dist/Fast-Download-Manager.exe
