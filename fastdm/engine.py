@@ -5,6 +5,7 @@ import hashlib
 import os
 import shutil
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -22,12 +23,12 @@ class Segment:
 
 @dataclass
 class SpeedMeter:
-    """Tracks rolling and aggregate download throughput."""
+    """Stable rolling throughput meter shared by single and segmented downloads."""
 
+    window_seconds: float = 2.0
     baseline_bytes: int = 0
     baseline_time: float = field(default_factory=time.monotonic)
-    last_bytes: int = 0
-    last_time: float = field(default_factory=time.monotonic)
+    samples: deque[tuple[float, int]] = field(default_factory=deque, repr=False)
     speed: float = 0.0
     peak: float = 0.0
 
@@ -35,23 +36,28 @@ class SpeedMeter:
         now = time.monotonic()
         self.baseline_bytes = bytes_done
         self.baseline_time = now
-        self.last_bytes = bytes_done
-        self.last_time = now
+        self.samples.clear()
+        self.samples.append((now, bytes_done))
         self.speed = 0.0
         self.peak = 0.0
 
     def update(self, bytes_done: int) -> float:
         now = time.monotonic()
-        elapsed = now - self.last_time
-        delta = max(0, bytes_done - self.last_bytes)
-        if delta > 0:
-            sample = delta / max(elapsed, 0.001)
-            self.speed = sample
-            self.peak = max(self.peak, sample)
-            self.last_bytes = bytes_done
-            self.last_time = now
-        elif elapsed >= 2.0:
-            self.speed = 0.0
+        if not self.samples:
+            self.samples.append((now, bytes_done))
+        elif bytes_done > self.samples[-1][1]:
+            self.samples.append((now, bytes_done))
+
+        cutoff = now - self.window_seconds
+        while len(self.samples) > 1 and self.samples[1][0] <= cutoff:
+            self.samples.popleft()
+
+        if len(self.samples) >= 2:
+            elapsed = max(now - self.samples[0][0], 0.001)
+            delta = max(0, bytes_done - self.samples[0][1])
+            if delta > 0:
+                self.speed = delta / elapsed
+                self.peak = max(self.peak, self.speed)
         return self.speed
 
     def average(self, bytes_done: int) -> float:
@@ -127,13 +133,13 @@ class DownloadEngine:
         self._pause.discard(task.id)
         task.status = "analyzing"
         task.error = None
-        task.speed_meter.reset(task.downloaded)
         try:
             metadata = await self.analyze(task.url)
             task.url = metadata["url"]
             task.total = metadata["size"]
             task.status = "downloading"
             task.destination.parent.mkdir(parents=True, exist_ok=True)
+            task.speed_meter.reset(task.downloaded)
             if task.total and metadata["range"] and task.total >= 4 * 1024 * 1024:
                 await self._segmented(task, progress)
             else:
@@ -225,7 +231,7 @@ class DownloadEngine:
                 output.flush()
                 task.downloaded = output.tell() if not initial else initial + output.tell()
                 task.speed = self._update_speed(task)
-                task.peak_speed = max(task.peak_speed, task.speed)
+                task.peak_speed = max(task.peak_speed, task.speed_meter.peak)
                 if progress:
                     progress(task)
 
@@ -280,7 +286,7 @@ class DownloadEngine:
                                     async with lock:
                                         task.downloaded = sum(s.downloaded for s in task.segments)
                                         task.speed = self._update_speed(task)
-                                        task.peak_speed = max(task.peak_speed, task.speed)
+                                        task.peak_speed = max(task.peak_speed, task.speed_meter.peak)
                                     if progress:
                                         progress(task)
                             if have != segment.end - segment.start + 1:
@@ -325,11 +331,13 @@ class DownloadEngine:
 
     @staticmethod
     def _update_speed(task: DownloadTask) -> float:
-        instantaneous = task.speed_meter.update(task.downloaded)
+        rolling = task.speed_meter.update(task.downloaded)
         average = task.speed_meter.average(task.downloaded)
-        if task.downloaded > task.speed_meter.baseline_bytes:
-            return max(instantaneous, average)
-        return instantaneous
+        if rolling > 0:
+            return rolling
+        if average > 0 and task.downloaded > task.speed_meter.baseline_bytes:
+            return average
+        return 0.0
 
     def pause(self, task_id: str) -> None:
         self._pause.add(task_id)
